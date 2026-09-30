@@ -2,43 +2,56 @@
 // MDE ENDPOINT — Process, Network, Persistence, IR
 // Platform: Microsoft Defender XDR — Advanced Hunting
 // Tables: DeviceProcessEvents, DeviceNetworkEvents, DeviceFileEvents,
-//         DeviceLogonEvents, DeviceEvents
+//         DeviceLogonEvents, DeviceEvents, DeviceRegistryEvents
+//
+// SCHEMA NOTES
+// - DeviceFileEvents / DeviceNetworkEvents / DeviceRegistryEvents have no
+//   AccountName column; use InitiatingProcessAccountName.
+// - Registry changes (RegistryValueSet) are in DeviceRegistryEvents, not DeviceEvents.
+// - Use RemoteIPType == "Public" rather than string-matching IP prefixes.
+// - DeviceId is returned where practical, so a query can become a
+//   custom detection with device actions (isolate, AV scan, etc.).
 // ============================================================================
 
 // ── 1. PROCESS EXECUTION ANOMALIES ───────────────────────────────────────────
 
 // 1.1 LOLBIN execution spawned from Office apps
-let OfficeProcs  = dynamic(["winword.exe","excel.exe","powerpnt.exe","outlook.exe","onenote.exe"]);
-let SuspLolbins  = dynamic(["powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe",
-    "rundll32.exe","regsvr32.exe","certutil.exe","bitsadmin.exe","msiexec.exe","wmic.exe"]);
+let OfficeProcs  = dynamic(["winword.exe","excel.exe","powerpnt.exe","outlook.exe","onenote.exe","mspub.exe","visio.exe"]);
+let SuspLolbins  = dynamic(["powershell.exe","pwsh.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe",
+    "rundll32.exe","regsvr32.exe","certutil.exe","bitsadmin.exe","msiexec.exe","wmic.exe","curl.exe"]);
 DeviceProcessEvents
 | where Timestamp > ago(7d)
 | where InitiatingProcessFileName in~ (OfficeProcs)
 | where FileName in~ (SuspLolbins)
-| project Timestamp, DeviceName, InitiatingProcessFileName, FileName,
-    ProcessCommandLine, InitiatingProcessCommandLine, AccountName
-
-// ──────────────────────────────────────────────────────────────────────────────
-
-// 1.2 PowerShell encoded command (base64 obfuscation)
-DeviceProcessEvents
-| where Timestamp > ago(7d)
-| where FileName =~ "powershell.exe" or FileName =~ "pwsh.exe"
-| where ProcessCommandLine has_any ("-EncodedCommand", "-enc ", "-ec ", "-e ")
-| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| project Timestamp, DeviceId, DeviceName, AccountName, InitiatingProcessFileName, FileName,
+    ProcessCommandLine, InitiatingProcessCommandLine, ReportId
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.3 Recon commands via cmd.exe (whoami, net, ipconfig, etc.)
-let ReconCmds = dynamic(["whoami","net user","net group","ipconfig","systeminfo",
-    "nltest","arp","netstat","tasklist","quser","query session"]);
+// 1.2 PowerShell encoded command (base64 obfuscation)
+// Matches -e / -en / -enc ... -EncodedCommand / -ec followed by a base64 blob
 DeviceProcessEvents
 | where Timestamp > ago(7d)
-| where InitiatingProcessFileName =~ "cmd.exe"
+| where FileName in~ ("powershell.exe", "pwsh.exe", "powershell_ise.exe")
+| where ProcessCommandLine matches regex @"(?i)\s[-/]e(c|n|nc|nco|ncod|ncode|ncoded|ncodedc|ncodedco|ncodedcom|ncodedcomm|ncodedcomma|ncodedcomman|ncodedcommand)?\s+['""]?[A-Za-z0-9+/=]{20,}"
+| extend EncodedBlob = extract(@"([A-Za-z0-9+/=]{20,})", 1, ProcessCommandLine)
+| extend Decoded = base64_decode_tostring(EncodedBlob) // UTF-16LE text shows spaced-out chars
+| project Timestamp, DeviceId, DeviceName, AccountName, ProcessCommandLine, Decoded,
+    InitiatingProcessFileName, ReportId
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.3 Recon command burst (3+ recon commands per device/user per hour)
+let ReconCmds = dynamic(["whoami","net user","net group","net localgroup","ipconfig","systeminfo",
+    "nltest","arp -a","netstat","tasklist","quser","query session","net view","dsquery"]);
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ ("cmd.exe","powershell.exe","pwsh.exe")
 | where ProcessCommandLine has_any (ReconCmds)
 | summarize ReconCount = count(), Commands = make_set(ProcessCommandLine, 20)
-    by DeviceName, AccountName, bin(Timestamp, 1h)
+    by DeviceId, DeviceName, AccountName, bin(Timestamp, 1h)
 | where ReconCount >= 3
 | order by ReconCount desc
 
@@ -47,22 +60,27 @@ DeviceProcessEvents
 // 1.4 PsExec / remote execution tool usage
 DeviceProcessEvents
 | where Timestamp > ago(7d)
-| where FileName =~ "PsExec.exe" or FileName =~ "PsExec64.exe"
-    or ProcessCommandLine has_any ("\\\\ADMIN$", "\\\\IPC$", "-accepteula")
-| project Timestamp, DeviceName, AccountName, FileName,
-    ProcessCommandLine, InitiatingProcessFileName
+| where FileName in~ ("psexec.exe","psexec64.exe","psexesvc.exe","paexec.exe")
+    or ProcessVersionInfoOriginalFileName in~ ("psexec.c","psexesvc.exe")
+    or (ProcessCommandLine has_any (@"\ADMIN$", @"\IPC$", @"\C$") and ProcessCommandLine has "-accepteula")
+| project Timestamp, DeviceId, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName, ReportId
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.5 Unusual process launched from writable paths
+// 1.5 Unusual process launched from user-writable paths
 DeviceProcessEvents
 | where Timestamp > ago(7d)
 | where FolderPath has_any (@"\AppData\Local\Temp\", @"\AppData\Roaming\",
     @"\Users\Public\", @"\ProgramData\", @"\Windows\Temp\")
 | where FileName !in~ ("setup.exe","installer.exe","update.exe")
 | where InitiatingProcessFileName !in~ ("explorer.exe","msiexec.exe","svchost.exe")
-| project Timestamp, DeviceName, AccountName, FolderPath, FileName,
-    ProcessCommandLine, InitiatingProcessFileName
+| summarize Executions = count(), Devices = dcount(DeviceId), SampleDevice = any(DeviceName),
+    SampleCommandLine = any(ProcessCommandLine), FirstSeen = min(Timestamp)
+    by FileName, FolderPath, SHA1
+| where Devices <= 3 // rare across the estate
+| order by FirstSeen desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -71,143 +89,160 @@ DeviceEvents
 | where Timestamp > ago(7d)
 | where ActionType == "OpenProcessApiCall"
 | where FileName =~ "lsass.exe"
-| where InitiatingProcessFileName !in~ ("MsMpEng.exe","csrss.exe","werfault.exe",
-    "svchost.exe","taskmgr.exe","WerFaultSecure.exe")
-| project Timestamp, DeviceName, AccountName,
-    InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessSHA256
+| where InitiatingProcessFileName !in~ ("MsMpEng.exe","MsSense.exe","SenseIR.exe","csrss.exe",
+    "werfault.exe","WerFaultSecure.exe","svchost.exe","taskmgr.exe","wininit.exe","lsm.exe")
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessAccountName,
+    InitiatingProcessFileName, InitiatingProcessFolderPath, InitiatingProcessCommandLine,
+    InitiatingProcessSHA1, ReportId
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.7 VSS / shadow copy deletion (ransomware pre-encryption step)
+// 1.7 VSS / shadow copy / backup deletion (ransomware pre-encryption step)
 DeviceProcessEvents
 | where Timestamp > ago(7d)
 | where ProcessCommandLine has_any (
     "vssadmin delete shadows",
+    "vssadmin resize shadowstorage",
     "wmic shadowcopy delete",
+    "Win32_ShadowCopy",
     "bcdedit /set recoveryenabled no",
+    "bcdedit /set bootstatuspolicy ignoreallfailures",
     "wbadmin delete catalog",
-    "diskshadow /s"
-)
-| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+    "wbadmin delete systemstatebackup",
+    "diskshadow /s")
+| project Timestamp, DeviceId, DeviceName, AccountName, FileName, ProcessCommandLine,
+    InitiatingProcessFileName, ReportId
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.8 Mass file encryption indicator (5-minute bucket, high rename/write volume)
+// 1.8 Mass file rename to a new extension (ransomware encryption indicator)
 DeviceFileEvents
 | where Timestamp > ago(24h)
-| where ActionType in ("FileModified", "FileRenamed", "FileCreated")
-| where FileName matches regex @"\.[a-z0-9]{4,8}$" // unknown extension pattern
-| summarize FileCount = count(), Extensions = dcount(extract(@"\.([^.]+)$", 1, FileName)),
+| where ActionType == "FileRenamed"
+| extend NewExt = tolower(extract(@"\.([^.\\]+)$", 1, FileName)),
+         OldExt = tolower(extract(@"\.([^.\\]+)$", 1, PreviousFileName))
+| where isnotempty(NewExt) and NewExt != OldExt
+| summarize FileCount = count(), NewExtensions = make_set(NewExt, 5),
     SampleFiles = make_set(FileName, 5)
-    by DeviceName, AccountName, bin(Timestamp, 5m)
+    by DeviceId, DeviceName, InitiatingProcessAccountName, InitiatingProcessFileName, bin(Timestamp, 5m)
 | where FileCount >= 100
 | order by FileCount desc
 
 // ── 2. NETWORK IOC HUNTING ───────────────────────────────────────────────────
 
-// 2.1 Outbound connections to rare/new external IPs
-let InternalRanges = dynamic(["10.","192.168.","172.16.","172.17.","172.18.",
-    "172.19.","172.20.","172.21.","172.22.","172.23.","172.24.","172.25.",
-    "172.26.","172.27.","172.28.","172.29.","172.30.","172.31."]);
+// 2.1 Outbound connections to rare public destinations (seen from <=2 devices)
 DeviceNetworkEvents
 | where Timestamp > ago(7d)
 | where ActionType == "ConnectionSuccess"
-| where not (RemoteIP has_any (InternalRanges))
-| where not (RemoteUrl has_any ("microsoft.com","windowsupdate.com","office.com",
-    "live.com","azure.com","akamai.com","cloudflare.com"))
-| summarize ConnectionCount = count(), FirstSeen = min(Timestamp),
-    Processes = make_set(InitiatingProcessFileName)
+| where RemoteIPType == "Public"
+| where not(RemoteUrl has_any ("microsoft.com","windowsupdate.com","office.com","office.net",
+    "live.com","azure.com","msedge.net","akamai.com","akamaiedge.net","cloudflare.com"))
+| summarize ConnectionCount = count(), Devices = dcount(DeviceId), SampleDevice = any(DeviceName),
+    FirstSeen = min(Timestamp), Processes = make_set(InitiatingProcessFileName, 10)
     by RemoteIP, RemoteUrl, RemotePort
-| where ConnectionCount <= 3
+| where Devices <= 2 and ConnectionCount <= 5
 | order by FirstSeen desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.2 DNS beaconing pattern (high-frequency small lookups — C2 indicator)
+// 2.2 Beaconing / DGA-style pattern — many unique subdomains of one parent domain
 DeviceNetworkEvents
 | where Timestamp > ago(24h)
-| where ActionType == "DnsQueryResponse"
-| summarize QueryCount = count(), UniqueSubdomains = dcount(RemoteUrl),
-    FirstQuery = min(Timestamp), LastQuery = max(Timestamp)
-    by DeviceName, RemoteUrl
-| where QueryCount >= 50 and UniqueSubdomains >= 20
-| extend QueryRatePerMinute = QueryCount / max_of(1.0, datetime_diff('minute', LastQuery, FirstQuery))
-| where QueryRatePerMinute >= 5
-| order by QueryRatePerMinute desc
+| where isnotempty(RemoteUrl) and RemoteIPType == "Public"
+| extend Host = tolower(extract(@"^(?:[a-zA-Z]+://)?([^/:]+)", 1, RemoteUrl))
+| extend ParentDomain = extract(@"([^.]+\.[^.]+)$", 1, Host)
+| where isnotempty(ParentDomain)
+| where ParentDomain !in ("microsoft.com","windows.com","office.com","office.net","live.com",
+    "azure.com","msedge.net","akamaiedge.net","cloudflare.com","googleapis.com","amazonaws.com")
+| summarize Connections = count(), UniqueSubdomains = dcount(Host),
+    SampleHosts = make_set(Host, 10), FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by DeviceId, DeviceName, ParentDomain
+| where UniqueSubdomains >= 20 and Connections >= 50
+| extend PerMinute = round(Connections / max_of(1.0, todouble(datetime_diff('minute', LastSeen, FirstSeen))), 2)
+| order by UniqueSubdomains desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.3 SMB lateral movement (port 445 from non-DC, multiple targets)
+// 2.3 SMB fan-out (port 445 to 5+ hosts in 1 hour) — exclude file servers/DCs as needed
 DeviceNetworkEvents
 | where Timestamp > ago(7d)
 | where RemotePort == 445
 | where ActionType == "ConnectionSuccess"
 | summarize TargetCount = dcount(RemoteIP), Targets = make_set(RemoteIP, 10)
-    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+    by DeviceId, DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
 | where TargetCount >= 5
 | order by TargetCount desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.4 RDP lateral movement detection (port 3389, multiple targets)
+// 2.4 RDP fan-out (port 3389 to 3+ hosts in 1 hour)
 DeviceNetworkEvents
 | where Timestamp > ago(7d)
 | where RemotePort == 3389
 | where ActionType == "ConnectionSuccess"
-| summarize RdpCount = count(), Targets = make_set(RemoteIP),
-    SourceProcesses = make_set(InitiatingProcessFileName)
-    by DeviceName, bin(Timestamp, 1h)
-| where RdpCount >= 3
-| order by RdpCount desc
+| summarize TargetCount = dcount(RemoteIP), Targets = make_set(RemoteIP, 10),
+    SourceProcesses = make_set(InitiatingProcessFileName, 5)
+    by DeviceId, DeviceName, bin(Timestamp, 1h)
+| where TargetCount >= 3
+| order by TargetCount desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
 // 2.5 IR: Multi-table IP IOC hunt (union — compatible with custom detection rules)
-// Replace ip value with IOC
 let ip = "1.2.3.4"; // replace with IOC IP
 union DeviceNetworkEvents, DeviceFileEvents, DeviceLogonEvents, DeviceEvents
 | where Timestamp > ago(7d)
 | where LocalIP == ip or RemoteIP == ip or FileOriginIP == ip
-| project Timestamp, DeviceId, DeviceName, ReportId,
+| project Timestamp, DeviceId, DeviceName, ReportId, ActionType,
     LocalIP, RemoteIP, FileOriginIP,
-    InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+    InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountName
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
 // 2.6 IR: Device network activity for specific domain (post-click investigation)
-// Replace TargetDomain with IOC domain
 let TargetDomain = "malicious-example.com"; // replace with IOC domain
 DeviceNetworkEvents
 | where Timestamp > ago(30d)
 | where RemoteUrl has TargetDomain
-| project Timestamp, DeviceName, RemoteUrl, RemoteIP, RemotePort,
-    BytesSent, BytesReceived,
+| project Timestamp, DeviceId, DeviceName, ActionType, RemoteUrl, RemoteIP, RemotePort,
     InitiatingProcessFileName, InitiatingProcessCommandLine,
     InitiatingProcessAccountName
 | order by Timestamp desc
 
 // ── 3. PERSISTENCE ───────────────────────────────────────────────────────────
 
-// 3.1 Scheduled task creation (common persistence mechanism)
-DeviceProcessEvents
-| where Timestamp > ago(7d)
-| where FileName =~ "schtasks.exe"
-| where ProcessCommandLine has "/create"
-| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+// 3.1 Scheduled task creation (process + telemetry event)
+union
+    (DeviceProcessEvents
+    | where Timestamp > ago(7d)
+    | where FileName =~ "schtasks.exe" and ProcessCommandLine has "/create"
+    | project Timestamp, DeviceId, DeviceName, Source = "schtasks.exe",
+        Detail = ProcessCommandLine, InitiatingProcessFileName, Account = AccountName),
+    (DeviceEvents
+    | where Timestamp > ago(7d)
+    | where ActionType == "ScheduledTaskCreated"
+    | project Timestamp, DeviceId, DeviceName, Source = "ScheduledTaskCreated",
+        Detail = AdditionalFields, InitiatingProcessFileName, Account = InitiatingProcessAccountName)
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 3.2 Registry run key modifications
-DeviceEvents
+// 3.2 Registry Run / RunOnce key modifications
+DeviceRegistryEvents
 | where Timestamp > ago(7d)
 | where ActionType == "RegistryValueSet"
 | where RegistryKey has_any (
-    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-    @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
-    @"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"
-)
-| project Timestamp, DeviceName, AccountName, RegistryKey, RegistryValueName,
-    RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine
+    @"\Microsoft\Windows\CurrentVersion\Run",
+    @"\Microsoft\Windows\CurrentVersion\RunOnce",
+    @"\Wow6432Node\Microsoft\Windows\CurrentVersion\Run")
+| where InitiatingProcessFileName !in~ ("msiexec.exe","TrustedInstaller.exe")
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessAccountName, RegistryKey,
+    RegistryValueName, RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine,
+    ReportId
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
@@ -215,5 +250,9 @@ DeviceEvents
 DeviceEvents
 | where Timestamp > ago(7d)
 | where ActionType == "ServiceInstalled"
-| project Timestamp, DeviceName, AccountName,
-    AdditionalFields, InitiatingProcessFileName
+| extend Svc = parse_json(AdditionalFields)
+| project Timestamp, DeviceId, DeviceName, InitiatingProcessAccountName,
+    ServiceName = tostring(Svc.ServiceName), ServiceStartType = tostring(Svc.ServiceStartType),
+    ServiceAccount = tostring(Svc.ServiceAccount), FileName, FolderPath,
+    InitiatingProcessFileName, ReportId
+| order by Timestamp desc
