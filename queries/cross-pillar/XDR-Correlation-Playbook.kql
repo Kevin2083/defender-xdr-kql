@@ -1,0 +1,217 @@
+// ============================================================================
+// XDR CROSS-PILLAR CORRELATION — Kill Chain Playbooks
+// Platform: Microsoft Defender XDR — Advanced Hunting
+// Multi-table correlation across MDO, MDE, MDI, MDCA
+// NOTE: Run each section as an independent query (each has its own let blocks)
+// ============================================================================
+
+// ── C1. BEC KILL CHAIN ───────────────────────────────────────────────────────
+// Phish delivery → URL click → inbox rule creation → external forward
+// Tables: EmailEvents, UrlClickEvents, CloudAppEvents
+
+let lookback = 7d;
+let PhishDelivered =
+    EmailEvents
+    | where Timestamp > ago(lookback)
+    | where ThreatTypes has "Phish"
+    | where DeliveryAction == "Delivered"
+    | project PhishTime = Timestamp, RecipientEmailAddress,
+        NetworkMessageId, SenderFromAddress, Subject;
+
+let ClickedLinks =
+    UrlClickEvents
+    | where Timestamp > ago(lookback)
+    | where IsClickedThrough == true
+    | project ClickTime = Timestamp, AccountUpn, Url, NetworkMessageId;
+
+let InboxRuleCreated =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType in ("New-InboxRule","Set-InboxRule","UpdateInboxRules")
+    | extend RuleDetails = parse_json(RawEventData)
+    | where tostring(RuleDetails.ForwardTo) has "@"
+        or tostring(RuleDetails.DeleteMessage) == "true"
+    | project RuleTime = Timestamp, RuleAccountUpn = AccountUpn, IPAddress,
+        ForwardTo = tostring(RuleDetails.ForwardTo);
+
+PhishDelivered
+| join kind=inner ClickedLinks on NetworkMessageId
+| where ClickTime > PhishTime
+| join kind=inner InboxRuleCreated on $left.RecipientEmailAddress == $right.RuleAccountUpn
+| where RuleTime > ClickTime
+| project PhishTime, ClickTime, RuleTime, RecipientEmailAddress,
+    SenderFromAddress, Subject, Url, ForwardTo, IPAddress
+
+// ── C2. ACCOUNT TAKEOVER CHAIN ───────────────────────────────────────────────
+// MFA bypass / risky sign-in → cloud app activity spike
+// Tables: AADSignInEventsBeta, CloudAppEvents
+
+let lookback = 14d;
+let RiskySignIns =
+    AADSignInEventsBeta
+    | where Timestamp > ago(lookback)
+    | where RiskLevelDuringSignIn >= 50 or RiskLevelAggregated >= 50
+    | where ErrorCode == 0
+    | project SignInTime = Timestamp, AccountUpn, IPAddress, Country, RiskLevelDuringSignIn;
+
+let PostSignInActivity =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | summarize ActionCount = count(), Actions = make_set(ActionType, 20),
+        FirstAction = min(Timestamp)
+        by AccountUpn, bin(Timestamp, 1h);
+
+RiskySignIns
+| join kind=inner PostSignInActivity on AccountUpn
+| where FirstAction > SignInTime
+| where ActionCount >= 10
+| project SignInTime, FirstAction, AccountUpn, IPAddress, Country,
+    RiskLevelDuringSignIn, ActionCount, Actions
+
+// ── C3. NTLM → SMB → EXECUTION LATERAL MOVEMENT ─────────────────────────────
+// NTLM auth → SMB connection → process spawned on target
+// Tables: IdentityLogonEvents, DeviceNetworkEvents, DeviceProcessEvents
+
+let lookback = 24h;
+let NTLMLogons =
+    IdentityLogonEvents
+    | where Timestamp > ago(lookback)
+    | where Protocol == "NTLM"
+    | where ActionType == "LogonSuccess"
+    | project NTLMTime = Timestamp, AccountUpn, SourceIP = IPAddress, TargetDevice = TargetDeviceName;
+
+let SMBConnections =
+    DeviceNetworkEvents
+    | where Timestamp > ago(lookback)
+    | where RemotePort == 445
+    | where ActionType == "ConnectionSuccess"
+    | project SMBTime = Timestamp, DeviceName, RemoteIP, InitiatingProcessFileName;
+
+let ProcessExecution =
+    DeviceProcessEvents
+    | where Timestamp > ago(lookback)
+    | project ExecTime = Timestamp, DeviceName, FileName, ProcessCommandLine, AccountName;
+
+NTLMLogons
+| join kind=inner SMBConnections on $left.SourceIP == $right.RemoteIP
+| where SMBTime > NTLMTime
+| join kind=inner ProcessExecution on $left.TargetDevice == $right.DeviceName
+| where ExecTime > SMBTime
+| project NTLMTime, SMBTime, ExecTime, AccountUpn, SourceIP,
+    TargetDevice, FileName, ProcessCommandLine
+
+// ── C4. CREDENTIAL DUMP → LDAP RECON → DOMAIN LOGON ─────────────────────────
+// LSASS dump → LDAP bulk enumeration → lateral network logon
+// Tables: DeviceEvents, IdentityQueryEvents, IdentityLogonEvents
+
+let lookback = 24h;
+let CredentialDump =
+    DeviceEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType == "OpenProcessApiCall"
+    | where FileName =~ "lsass.exe"
+    | where InitiatingProcessFileName !in~ ("MsMpEng.exe","csrss.exe","werfault.exe")
+    | project DumpTime = Timestamp, DeviceName, AccountName, InitiatingProcessFileName;
+
+let LdapRecon =
+    IdentityQueryEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType == "LdapSearch"
+    | where QueryCount >= 20
+    | project ReconTime = Timestamp, AccountUpn, IPAddress, QueryCount;
+
+let DomainLogons =
+    IdentityLogonEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType == "LogonSuccess"
+    | where LogonType == "Network"
+    | project LogonTime = Timestamp, AccountUpn, TargetDeviceName;
+
+CredentialDump
+| join kind=inner LdapRecon on $left.AccountName == $right.AccountUpn
+| where ReconTime > DumpTime
+| join kind=inner DomainLogons on $left.AccountName == $right.AccountUpn
+| where LogonTime > ReconTime
+| project DumpTime, ReconTime, LogonTime, AccountName,
+    SourceDevice = DeviceName, InitiatingProcessFileName, TargetDeviceName
+
+// ── C5. INSIDER: BULK DOWNLOAD + EXTERNAL SHARE ──────────────────────────────
+// Recently dormant user (likely resigning) + bulk cloud download + external share
+// Tables: AADSignInEventsBeta, CloudAppEvents
+
+let lookback = 30d;
+let RecentlyDormant =
+    AADSignInEventsBeta
+    | where Timestamp > ago(180d)
+    | summarize LastSignin = max(Timestamp) by AccountUpn = UserPrincipalName
+    | where LastSignin between (ago(lookback) .. ago(7d));
+
+let BulkDownloads =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType in ("FileDownloaded","FileSyncDownloadedFull")
+    | summarize Downloads = count(),
+        SizeBytes = sum(tolong(parse_json(RawEventData).FileSizeBytes))
+        by AccountUpn, bin(Timestamp, 1d)
+    | where Downloads >= 50;
+
+let ExternalShares =
+    CloudAppEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType in ("SharingInvitationCreated","AnonymousLinkCreated")
+    | project ShareTime = Timestamp, AccountUpn, IPAddress;
+
+RecentlyDormant
+| join kind=inner BulkDownloads on AccountUpn
+| join kind=inner ExternalShares on AccountUpn
+| project AccountUpn, LastSignin, Downloads, SizeBytes, ShareTime, IPAddress
+
+// ── C6. RANSOMWARE KILL CHAIN ────────────────────────────────────────────────
+// Phish email → shadow copy delete → mass file encryption
+// Tables: EmailEvents, DeviceProcessEvents, DeviceFileEvents
+
+let lookback = 24h;
+let PhishDelivered =
+    EmailEvents
+    | where Timestamp > ago(lookback)
+    | where ThreatTypes has "Phish"
+    | where DeliveryAction == "Delivered"
+    | distinct RecipientEmailAddress;
+
+let ShadowDelete =
+    DeviceProcessEvents
+    | where Timestamp > ago(lookback)
+    | where ProcessCommandLine has_any (
+        "vssadmin delete shadows",
+        "wmic shadowcopy delete",
+        "bcdedit /set recoveryenabled no"
+    )
+    | project ShadowTime = Timestamp, DeviceName, AccountName, ProcessCommandLine;
+
+let MassEncrypt =
+    DeviceFileEvents
+    | where Timestamp > ago(lookback)
+    | where ActionType in ("FileModified","FileRenamed")
+    | summarize FileCount = count()
+        by DeviceName, AccountName, bin(Timestamp, 5m)
+    | where FileCount >= 100
+    | project EncryptTime = Timestamp, DeviceName, AccountName, FileCount;
+
+ShadowDelete
+| join kind=inner MassEncrypt on DeviceName
+| where EncryptTime > ShadowTime
+| project ShadowTime, EncryptTime, DeviceName, AccountName, ProcessCommandLine, FileCount
+
+// ── C7. ORPHAN HIGH/MEDIUM ALERTS WITHOUT INCIDENTS ──────────────────────────
+// Surfaces high/medium severity alerts not attached to any incident
+// Useful for finding detections that slipped through triage
+AlertInfo
+| where Timestamp > ago(7d)
+| where Severity in ("High","Medium")
+| join kind=leftanti (
+    AlertEvidence
+    | where isnotempty(ServiceSource)
+    | distinct AlertId
+) on AlertId
+| project Timestamp, AlertId, Title, Severity, Category, ServiceSource, DetectionSource
+| order by Severity asc, Timestamp desc
