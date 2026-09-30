@@ -1,0 +1,219 @@
+// ============================================================================
+// MDE ENDPOINT — Process, Network, Persistence, IR
+// Platform: Microsoft Defender XDR — Advanced Hunting
+// Tables: DeviceProcessEvents, DeviceNetworkEvents, DeviceFileEvents,
+//         DeviceLogonEvents, DeviceEvents
+// ============================================================================
+
+// ── 1. PROCESS EXECUTION ANOMALIES ───────────────────────────────────────────
+
+// 1.1 LOLBIN execution spawned from Office apps
+let OfficeProcs  = dynamic(["winword.exe","excel.exe","powerpnt.exe","outlook.exe","onenote.exe"]);
+let SuspLolbins  = dynamic(["powershell.exe","cmd.exe","wscript.exe","cscript.exe","mshta.exe",
+    "rundll32.exe","regsvr32.exe","certutil.exe","bitsadmin.exe","msiexec.exe","wmic.exe"]);
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName in~ (OfficeProcs)
+| where FileName in~ (SuspLolbins)
+| project Timestamp, DeviceName, InitiatingProcessFileName, FileName,
+    ProcessCommandLine, InitiatingProcessCommandLine, AccountName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.2 PowerShell encoded command (base64 obfuscation)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "powershell.exe" or FileName =~ "pwsh.exe"
+| where ProcessCommandLine has_any ("-EncodedCommand", "-enc ", "-ec ", "-e ")
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.3 Recon commands via cmd.exe (whoami, net, ipconfig, etc.)
+let ReconCmds = dynamic(["whoami","net user","net group","ipconfig","systeminfo",
+    "nltest","arp","netstat","tasklist","quser","query session"]);
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where InitiatingProcessFileName =~ "cmd.exe"
+| where ProcessCommandLine has_any (ReconCmds)
+| summarize ReconCount = count(), Commands = make_set(ProcessCommandLine, 20)
+    by DeviceName, AccountName, bin(Timestamp, 1h)
+| where ReconCount >= 3
+| order by ReconCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.4 PsExec / remote execution tool usage
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "PsExec.exe" or FileName =~ "PsExec64.exe"
+    or ProcessCommandLine has_any ("\\\\ADMIN$", "\\\\IPC$", "-accepteula")
+| project Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.5 Unusual process launched from writable paths
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FolderPath has_any (@"\AppData\Local\Temp\", @"\AppData\Roaming\",
+    @"\Users\Public\", @"\ProgramData\", @"\Windows\Temp\")
+| where FileName !in~ ("setup.exe","installer.exe","update.exe")
+| where InitiatingProcessFileName !in~ ("explorer.exe","msiexec.exe","svchost.exe")
+| project Timestamp, DeviceName, AccountName, FolderPath, FileName,
+    ProcessCommandLine, InitiatingProcessFileName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.6 LSASS access (credential dumping indicator)
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType == "OpenProcessApiCall"
+| where FileName =~ "lsass.exe"
+| where InitiatingProcessFileName !in~ ("MsMpEng.exe","csrss.exe","werfault.exe",
+    "svchost.exe","taskmgr.exe","WerFaultSecure.exe")
+| project Timestamp, DeviceName, AccountName,
+    InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessSHA256
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.7 VSS / shadow copy deletion (ransomware pre-encryption step)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where ProcessCommandLine has_any (
+    "vssadmin delete shadows",
+    "wmic shadowcopy delete",
+    "bcdedit /set recoveryenabled no",
+    "wbadmin delete catalog",
+    "diskshadow /s"
+)
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.8 Mass file encryption indicator (5-minute bucket, high rename/write volume)
+DeviceFileEvents
+| where Timestamp > ago(24h)
+| where ActionType in ("FileModified", "FileRenamed", "FileCreated")
+| where FileName matches regex @"\.[a-z0-9]{4,8}$" // unknown extension pattern
+| summarize FileCount = count(), Extensions = dcount(extract(@"\.([^.]+)$", 1, FileName)),
+    SampleFiles = make_set(FileName, 5)
+    by DeviceName, AccountName, bin(Timestamp, 5m)
+| where FileCount >= 100
+| order by FileCount desc
+
+// ── 2. NETWORK IOC HUNTING ───────────────────────────────────────────────────
+
+// 2.1 Outbound connections to rare/new external IPs
+let InternalRanges = dynamic(["10.","192.168.","172.16.","172.17.","172.18.",
+    "172.19.","172.20.","172.21.","172.22.","172.23.","172.24.","172.25.",
+    "172.26.","172.27.","172.28.","172.29.","172.30.","172.31."]);
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ConnectionSuccess"
+| where not (RemoteIP has_any (InternalRanges))
+| where not (RemoteUrl has_any ("microsoft.com","windowsupdate.com","office.com",
+    "live.com","azure.com","akamai.com","cloudflare.com"))
+| summarize ConnectionCount = count(), FirstSeen = min(Timestamp),
+    Processes = make_set(InitiatingProcessFileName)
+    by RemoteIP, RemoteUrl, RemotePort
+| where ConnectionCount <= 3
+| order by FirstSeen desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.2 DNS beaconing pattern (high-frequency small lookups — C2 indicator)
+DeviceNetworkEvents
+| where Timestamp > ago(24h)
+| where ActionType == "DnsQueryResponse"
+| summarize QueryCount = count(), UniqueSubdomains = dcount(RemoteUrl),
+    FirstQuery = min(Timestamp), LastQuery = max(Timestamp)
+    by DeviceName, RemoteUrl
+| where QueryCount >= 50 and UniqueSubdomains >= 20
+| extend QueryRatePerMinute = QueryCount / max_of(1.0, datetime_diff('minute', LastQuery, FirstQuery))
+| where QueryRatePerMinute >= 5
+| order by QueryRatePerMinute desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.3 SMB lateral movement (port 445 from non-DC, multiple targets)
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 445
+| where ActionType == "ConnectionSuccess"
+| summarize TargetCount = dcount(RemoteIP), Targets = make_set(RemoteIP, 10)
+    by DeviceName, InitiatingProcessFileName, bin(Timestamp, 1h)
+| where TargetCount >= 5
+| order by TargetCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.4 RDP lateral movement detection (port 3389, multiple targets)
+DeviceNetworkEvents
+| where Timestamp > ago(7d)
+| where RemotePort == 3389
+| where ActionType == "ConnectionSuccess"
+| summarize RdpCount = count(), Targets = make_set(RemoteIP),
+    SourceProcesses = make_set(InitiatingProcessFileName)
+    by DeviceName, bin(Timestamp, 1h)
+| where RdpCount >= 3
+| order by RdpCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.5 IR: Multi-table IP IOC hunt (union — compatible with custom detection rules)
+// Replace ip value with IOC
+let ip = "1.2.3.4"; // replace with IOC IP
+union DeviceNetworkEvents, DeviceFileEvents, DeviceLogonEvents, DeviceEvents
+| where Timestamp > ago(7d)
+| where LocalIP == ip or RemoteIP == ip or FileOriginIP == ip
+| project Timestamp, DeviceId, DeviceName, ReportId,
+    LocalIP, RemoteIP, FileOriginIP,
+    InitiatingProcessFileName, InitiatingProcessCommandLine, AccountName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.6 IR: Device network activity for specific domain (post-click investigation)
+// Replace TargetDomain with IOC domain
+let TargetDomain = "malicious-example.com"; // replace with IOC domain
+DeviceNetworkEvents
+| where Timestamp > ago(30d)
+| where RemoteUrl has TargetDomain
+| project Timestamp, DeviceName, RemoteUrl, RemoteIP, RemotePort,
+    BytesSent, BytesReceived,
+    InitiatingProcessFileName, InitiatingProcessCommandLine,
+    InitiatingProcessAccountName
+| order by Timestamp desc
+
+// ── 3. PERSISTENCE ───────────────────────────────────────────────────────────
+
+// 3.1 Scheduled task creation (common persistence mechanism)
+DeviceProcessEvents
+| where Timestamp > ago(7d)
+| where FileName =~ "schtasks.exe"
+| where ProcessCommandLine has "/create"
+| project Timestamp, DeviceName, AccountName, ProcessCommandLine, InitiatingProcessFileName
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.2 Registry run key modifications
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType == "RegistryValueSet"
+| where RegistryKey has_any (
+    @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce",
+    @"SOFTWARE\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"
+)
+| project Timestamp, DeviceName, AccountName, RegistryKey, RegistryValueName,
+    RegistryValueData, InitiatingProcessFileName, InitiatingProcessCommandLine
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.3 New service installation
+DeviceEvents
+| where Timestamp > ago(7d)
+| where ActionType == "ServiceInstalled"
+| project Timestamp, DeviceName, AccountName,
+    AdditionalFields, InitiatingProcessFileName
