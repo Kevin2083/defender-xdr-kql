@@ -1,0 +1,275 @@
+// ============================================================================
+// MDI / ENTRA ID IDENTITY — Logon, Recon, Privilege Escalation, Lateral Movement
+// Platform: Microsoft Defender XDR — Advanced Hunting
+// Tables: IdentityLogonEvents, IdentityDirectoryEvents, IdentityQueryEvents,
+//         AADSignInEventsBeta, CloudAppEvents
+// ============================================================================
+
+// ── 1. SIGN-IN & AUTHENTICATION ──────────────────────────────────────────────
+
+// 1.1 Failed sign-ins by user (>5 failures in 7 days)
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonFailed"
+| summarize FailedAttempts = count() by AccountUpn, IPAddress, Application
+| where FailedAttempts > 5
+| order by FailedAttempts desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.2 Successful sign-ins from new countries (leftanti baseline)
+let knownCountries =
+    IdentityLogonEvents
+    | where Timestamp between (ago(30d) .. ago(7d))
+    | where ActionType == "LogonSuccess"
+    | distinct AccountUpn, Location;
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| where Location != ""
+| join kind=leftanti knownCountries on AccountUpn, Location
+| project Timestamp, AccountUpn, Location, IPAddress, Application, DeviceName
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.3 Legacy authentication sign-ins (IMAP/POP/SMTP/EAS — blocks MFA)
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ClientAppUsed in ("Exchange ActiveSync","IMAP4","POP3","SMTP",
+    "Authenticated SMTP","Other clients")
+| project Timestamp, AccountUpn, ClientAppUsed, IPAddress, Country,
+    ErrorCode, RiskLevelDuringSignIn
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.4 Sign-ins outside business hours
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| extend HourOfDay = hourofday(Timestamp)
+| where HourOfDay < 6 or HourOfDay > 22
+| project Timestamp, AccountUpn, IPAddress, Location, Application, HourOfDay
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.5 Token theft detection (3+ countries or 10+ IPs per account in 7d)
+AADSignInEventsBeta
+| where Timestamp > ago(7d)
+| where ErrorCode == 0
+| summarize
+    UniqueIPs       = dcount(IPAddress),
+    UniqueCountries = dcount(Country),
+    UniqueDevices   = dcount(DeviceName),
+    SignInCount     = count()
+    by AccountUpn
+| where UniqueCountries > 3 or UniqueIPs > 10
+| order by UniqueCountries desc, UniqueIPs desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.6 Password spray detection (10+ targeted accounts from one IP per hour)
+IdentityLogonEvents
+| where Timestamp > ago(24h)
+| where ActionType == "LogonFailed"
+| where FailureReason has_any ("password","credential","invalid")
+| summarize
+    TargetedAccounts = dcount(AccountUpn),
+    AttemptCount     = count()
+    by IPAddress, bin(Timestamp, 1h)
+| where TargetedAccounts > 10
+| order by TargetedAccounts desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.7 Brute force — single account (10+ failures per 15 minutes)
+IdentityLogonEvents
+| where Timestamp > ago(24h)
+| where ActionType == "LogonFailed"
+| summarize FailedAttempts = count() by AccountUpn, IPAddress, bin(Timestamp, 15m)
+| where FailedAttempts > 10
+| order by FailedAttempts desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.8 Successful login after multiple failures (credential stuffing success)
+let failures =
+    IdentityLogonEvents
+    | where Timestamp > ago(24h)
+    | where ActionType == "LogonFailed"
+    | summarize FailedAttempts = count(), LastFailure = max(Timestamp) by AccountUpn, IPAddress;
+let successes =
+    IdentityLogonEvents
+    | where Timestamp > ago(24h)
+    | where ActionType == "LogonSuccess"
+    | project SuccessTime = Timestamp, AccountUpn, IPAddress;
+failures
+| join kind=inner successes on AccountUpn, IPAddress
+| where SuccessTime > LastFailure
+| where FailedAttempts > 5
+| project AccountUpn, IPAddress, FailedAttempts, LastFailure, SuccessTime,
+    TimeBetween = SuccessTime - LastFailure
+| order by FailedAttempts desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.9 Dormant account suddenly active (no sign-in for 60d, now active)
+let dormantThreshold = 60d;
+let dormantAccounts =
+    IdentityLogonEvents
+    | where Timestamp between (ago(dormantThreshold) .. ago(7d))
+    | where ActionType == "LogonSuccess"
+    | distinct AccountUpn;
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| join kind=leftanti dormantAccounts on AccountUpn
+| project Timestamp, AccountUpn, IPAddress, Location, Application
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.10 Device registration from IP not used in past 29 days
+let historicalDays = 29;
+let searchWindow   = 1d;
+let NewRegistrations =
+    AADSignInEventsBeta
+    | where Timestamp > ago(searchWindow)
+    | where Application == "Device Registration Service"
+    | where isnotempty(IPAddress) and isnotempty(AccountUpn)
+    | project RegTime = Timestamp, AccountUpn, RegIP = IPAddress,
+        Country, City, DeviceName, OSPlatform, Browser;
+NewRegistrations
+| join kind=leftanti (
+    AADSignInEventsBeta
+    | where Timestamp between (ago(historicalDays + 1d) .. ago(searchWindow))
+    | where isnotempty(IPAddress) and isnotempty(AccountUpn)
+    | distinct AccountUpn, IPAddress
+) on AccountUpn, $left.RegIP == $right.IPAddress
+| project RegTime, AccountUpn, RegIP, Country, City, DeviceName, OSPlatform, Browser
+| sort by RegTime desc
+
+// ── 2. RECONNAISSANCE ────────────────────────────────────────────────────────
+
+// 2.1 LDAP bulk object enumeration (50+ queries per hour)
+IdentityQueryEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LdapSearch"
+| summarize QueryCount = count(), UniqueQueries = dcount(Query),
+    QueryTypes = make_set(QueryType, 10)
+    by AccountUpn, IPAddress, bin(Timestamp, 1h)
+| where QueryCount >= 50
+| order by QueryCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.2 SMB share enumeration (SamrEnumerateUsers)
+IdentityQueryEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("SamrSensitiveSecurityAccountRpc","SamrEnumerateUsers")
+| summarize EnumCount = count(), TargetMachines = make_set(TargetDeviceName)
+    by AccountUpn, IPAddress
+| order by EnumCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.3 Active Directory admin group enumeration via LDAP
+IdentityQueryEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LdapSearch"
+| where Query has_any ("Domain Admins","Enterprise Admins","Schema Admins",
+    "Administrators","Backup Operators","Account Operators")
+| project Timestamp, AccountUpn, IPAddress, Query, QueryType
+
+// ── 3. PRIVILEGE ESCALATION ──────────────────────────────────────────────────
+
+// 3.1 DCSync attack — DRSR replication rights abuse
+IdentityDirectoryEvents
+| where Timestamp > ago(7d)
+| where ActionType == "DirectoryServiceReplication"
+| where not (AccountUpn has_any ("MSOL_","AADConnect","AzureAD"))
+| project Timestamp, AccountUpn, AccountDomain, IPAddress,
+    TargetDeviceName, AdditionalFields
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.2 AdminSDHolder modification (ACL persistence technique)
+IdentityDirectoryEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ObjectModified"
+| where TargetObjectName contains "AdminSDHolder"
+| project Timestamp, AccountUpn, IPAddress, TargetObjectName, AdditionalFields
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.3 Privileged group membership changes (Domain/Enterprise Admins etc.)
+IdentityDirectoryEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("GroupMemberAdded","GroupMemberRemoved")
+| extend GroupName = tostring(parse_json(AdditionalFields).TargetObject)
+| where GroupName has_any ("Domain Admins","Enterprise Admins","Schema Admins",
+    "Protected Users","Administrators","Backup Operators")
+| project Timestamp, AccountUpn, ActionType, GroupName, IPAddress
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.4 Sensitive group changes (custom list — populate per environment)
+let sensitiveGroups = dynamic(["Domain Admins","Enterprise Admins",
+    "Global Administrators","Security Administrators",
+    "Exchange Administrators","Privileged Role Administrators"]);
+IdentityDirectoryEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("Group member added","Group member removed")
+| extend GroupName = tostring(AdditionalFields.["TO.GROUP"])
+| where GroupName has_any (sensitiveGroups)
+| extend TargetUser = tostring(AdditionalFields.["TARGET_OBJECT.USER"])
+| project Timestamp, AccountUpn, ActionType, GroupName, TargetUser, IPAddress
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.5 Azure AD role assignment changes
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("Add member to role","Remove member from role",
+    "Add eligible member to role")
+| extend RoleDetails = parse_json(RawEventData)
+| project Timestamp, AccountUpn, ActionType, IPAddress,
+    RoleName    = tostring(RoleDetails.Role_DisplayName),
+    TargetUser  = tostring(RoleDetails.TargetResources)
+
+// ── 4. NTLM / LATERAL MOVEMENT ───────────────────────────────────────────────
+
+// 4.1 NTLM logon anomalies (Pass-the-Hash indicators)
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where Protocol == "NTLM"
+| where ActionType == "LogonSuccess"
+| where not (IPAddress has_any ("10.","192.168.")) // customize to your internal ranges
+| project Timestamp, AccountUpn, IPAddress, TargetDeviceName, Protocol
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 4.2 Kerberoasting — SPN enumeration + TGS requests
+IdentityQueryEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LdapSearch"
+| where Query has "servicePrincipalName"
+| summarize SPNCount = count(), SPNs = make_set(Query, 20)
+    by AccountUpn, IPAddress, bin(Timestamp, 1h)
+| where SPNCount >= 5
+| order by SPNCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 4.3 Impossible travel — logon from 2+ countries within 4 hours
+IdentityLogonEvents
+| where Timestamp > ago(7d)
+| where ActionType == "LogonSuccess"
+| summarize Countries = dcount(Location), CountryList = make_set(Location, 10),
+    IPList = make_set(IPAddress, 10)
+    by AccountUpn, bin(Timestamp, 4h)
+| where Countries >= 2 and isnotempty(AccountUpn)
+| order by Countries desc
