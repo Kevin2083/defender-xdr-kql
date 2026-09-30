@@ -1,217 +1,242 @@
 // ============================================================================
 // XDR CROSS-PILLAR CORRELATION — Kill Chain Playbooks
 // Platform: Microsoft Defender XDR — Advanced Hunting
-// Multi-table correlation across MDO, MDE, MDI, MDCA
+// Multi-table correlation across MDO, MDE, MDI, MDCA, Entra ID
 // NOTE: Run each section as an independent query (each has its own let blocks)
+//
+// JOIN KEYS USED
+// - Email/UrlClick <-> CloudAppEvents: recipient UPN == RawEventData.UserId (lowercased)
+// - Entra sign-ins <-> CloudAppEvents: AccountObjectId
+// - MDI (short host names) <-> MDE (FQDN): normalized to lowercase short hostname
 // ============================================================================
 
 // ── C1. BEC KILL CHAIN ───────────────────────────────────────────────────────
-// Phish delivery → URL click → inbox rule creation → external forward
+// Phish delivered → user clicks through → suspicious inbox rule within 48h
 // Tables: EmailEvents, UrlClickEvents, CloudAppEvents
 
 let lookback = 7d;
 let PhishDelivered =
     EmailEvents
     | where Timestamp > ago(lookback)
-    | where ThreatTypes has "Phish"
+    | where ThreatTypes has "Phish" or OriginalThreatTypes has "Phish"
     | where DeliveryAction == "Delivered"
-    | project PhishTime = Timestamp, RecipientEmailAddress,
-        NetworkMessageId, SenderFromAddress, Subject;
-
+    | project PhishTime = Timestamp, NetworkMessageId,
+        User = tolower(RecipientEmailAddress), SenderFromAddress, Subject;
 let ClickedLinks =
     UrlClickEvents
     | where Timestamp > ago(lookback)
-    | where IsClickedThrough == true
-    | project ClickTime = Timestamp, AccountUpn, Url, NetworkMessageId;
-
+    | where ActionType == "ClickAllowed" or IsClickedThrough == true
+    | project ClickTime = Timestamp, NetworkMessageId, User = tolower(AccountUpn), Url;
 let InboxRuleCreated =
     CloudAppEvents
     | where Timestamp > ago(lookback)
     | where ActionType in ("New-InboxRule","Set-InboxRule","UpdateInboxRules")
-    | extend RuleDetails = parse_json(RawEventData)
-    | where tostring(RuleDetails.ForwardTo) has "@"
-        or tostring(RuleDetails.DeleteMessage) == "true"
-    | project RuleTime = Timestamp, RuleAccountUpn = AccountUpn, IPAddress,
-        ForwardTo = tostring(RuleDetails.ForwardTo);
-
+    | extend User = tolower(tostring(RawEventData.UserId)), Raw = tostring(RawEventData)
+    | mv-apply Param = RawEventData.Parameters on (
+        summarize RuleParams = make_bag(bag_pack(tostring(Param.Name), tostring(Param.Value))))
+    | extend ForwardTo = strcat(tostring(RuleParams.ForwardTo), tostring(RuleParams.RedirectTo),
+        tostring(RuleParams.ForwardAsAttachmentTo))
+    | where ForwardTo has "@" or tostring(RuleParams.DeleteMessage) =~ "true"
+        or tostring(RuleParams.MoveToFolder) has_any ("RSS","Deleted","Junk","Archive")
+        or (ActionType == "UpdateInboxRules" and Raw has_any ("ForwardToRecipientsAction",
+            "RedirectToRecipientsAction","DeleteAction","MoveToFolderAction"))
+    | project RuleTime = Timestamp, User, RuleIP = IPAddress, ActionType, ForwardTo;
 PhishDelivered
-| join kind=inner ClickedLinks on NetworkMessageId
-| where ClickTime > PhishTime
-| join kind=inner InboxRuleCreated on $left.RecipientEmailAddress == $right.RuleAccountUpn
-| where RuleTime > ClickTime
-| project PhishTime, ClickTime, RuleTime, RecipientEmailAddress,
-    SenderFromAddress, Subject, Url, ForwardTo, IPAddress
+| join kind=inner ClickedLinks on NetworkMessageId, User
+| where ClickTime between (PhishTime .. PhishTime + 2d)
+| join kind=inner InboxRuleCreated on User
+| where RuleTime between (ClickTime .. ClickTime + 2d)
+| project PhishTime, ClickTime, RuleTime, User, SenderFromAddress, Subject, Url,
+    ActionType, ForwardTo, RuleIP
+| order by RuleTime desc
 
 // ── C2. ACCOUNT TAKEOVER CHAIN ───────────────────────────────────────────────
-// MFA bypass / risky sign-in → cloud app activity spike
-// Tables: AADSignInEventsBeta, CloudAppEvents
+// Risky successful sign-in → burst of cloud activity within 2 hours
+// Tables: EntraIdSignInEvents, CloudAppEvents
 
 let lookback = 14d;
 let RiskySignIns =
-    AADSignInEventsBeta
+    EntraIdSignInEvents
     | where Timestamp > ago(lookback)
-    | where RiskLevelDuringSignIn >= 50 or RiskLevelAggregated >= 50
+    | where RiskLevelDuringSignIn >= 50 or RiskLevelAggregated >= 50 // medium or high
     | where ErrorCode == 0
-    | project SignInTime = Timestamp, AccountUpn, IPAddress, Country, RiskLevelDuringSignIn;
-
-let PostSignInActivity =
+    | project SignInTime = Timestamp, AccountObjectId, AccountUpn, SignInIP = IPAddress,
+        Country, RiskLevelDuringSignIn, RiskLevelAggregated;
+let CloudActivity =
     CloudAppEvents
     | where Timestamp > ago(lookback)
-    | summarize ActionCount = count(), Actions = make_set(ActionType, 20),
-        FirstAction = min(Timestamp)
-        by AccountUpn, bin(Timestamp, 1h);
-
+    | where isnotempty(AccountObjectId)
+    | project ActTime = Timestamp, AccountObjectId, ActionType, Application, ActIP = IPAddress;
 RiskySignIns
-| join kind=inner PostSignInActivity on AccountUpn
-| where FirstAction > SignInTime
+| join kind=inner CloudActivity on AccountObjectId
+| where ActTime between (SignInTime .. SignInTime + 2h)
+| summarize ActionCount = count(), Actions = make_set(ActionType, 25),
+    Apps = make_set(Application, 10), ActivityIPs = make_set(ActIP, 10)
+    by SignInTime, AccountUpn, SignInIP, Country, RiskLevelDuringSignIn, RiskLevelAggregated
 | where ActionCount >= 10
-| project SignInTime, FirstAction, AccountUpn, IPAddress, Country,
-    RiskLevelDuringSignIn, ActionCount, Actions
+| order by ActionCount desc
 
-// ── C3. NTLM → SMB → EXECUTION LATERAL MOVEMENT ─────────────────────────────
-// NTLM auth → SMB connection → process spawned on target
+// ── C3. NTLM → SMB → REMOTE EXECUTION LATERAL MOVEMENT ──────────────────────
+// NTLM logon to a host → SMB from source to that host → remote-exec child process on target
 // Tables: IdentityLogonEvents, DeviceNetworkEvents, DeviceProcessEvents
 
 let lookback = 24h;
 let NTLMLogons =
     IdentityLogonEvents
     | where Timestamp > ago(lookback)
-    | where Protocol == "NTLM"
-    | where ActionType == "LogonSuccess"
-    | project NTLMTime = Timestamp, AccountUpn, SourceIP = IPAddress, TargetDevice = TargetDeviceName;
-
+    | where Protocol == "NTLM" and ActionType == "LogonSuccess"
+    | where AccountName !endswith "$"
+    | extend Target = tolower(tostring(split(coalesce(DestinationDeviceName, TargetDeviceName), ".")[0]))
+    | where isnotempty(Target)
+    | project NTLMTime = Timestamp, AccountName, AccountDomain, SourceIP = IPAddress, Target;
 let SMBConnections =
     DeviceNetworkEvents
     | where Timestamp > ago(lookback)
-    | where RemotePort == 445
-    | where ActionType == "ConnectionSuccess"
-    | project SMBTime = Timestamp, DeviceName, RemoteIP, InitiatingProcessFileName;
-
-let ProcessExecution =
+    | where RemotePort == 445 and ActionType == "ConnectionSuccess"
+    | project SMBTime = Timestamp, SourceIP = LocalIP, SourceDevice = DeviceName,
+        TargetIP = RemoteIP, SmbProcess = InitiatingProcessFileName;
+let RemoteExec =
     DeviceProcessEvents
     | where Timestamp > ago(lookback)
-    | project ExecTime = Timestamp, DeviceName, FileName, ProcessCommandLine, AccountName;
-
+    | where InitiatingProcessFileName in~ ("services.exe","wmiprvse.exe","wsmprovhost.exe",
+        "psexesvc.exe","winrshost.exe","mmc.exe")
+    | where FileName !in~ ("svchost.exe","conhost.exe","WmiPrvSE.exe","dllhost.exe")
+    | extend Target = tolower(tostring(split(DeviceName, ".")[0]))
+    | project ExecTime = Timestamp, Target, TargetDeviceId = DeviceId, FileName,
+        ProcessCommandLine, ExecAccount = AccountName, ParentProcess = InitiatingProcessFileName;
 NTLMLogons
-| join kind=inner SMBConnections on $left.SourceIP == $right.RemoteIP
-| where SMBTime > NTLMTime
-| join kind=inner ProcessExecution on $left.TargetDevice == $right.DeviceName
-| where ExecTime > SMBTime
-| project NTLMTime, SMBTime, ExecTime, AccountUpn, SourceIP,
-    TargetDevice, FileName, ProcessCommandLine
+| join kind=inner SMBConnections on SourceIP
+| where SMBTime between ((NTLMTime - 5m) .. (NTLMTime + 5m))
+| join kind=inner RemoteExec on Target
+| where ExecTime between (NTLMTime .. NTLMTime + 15m)
+| project NTLMTime, SMBTime, ExecTime, AccountName, AccountDomain, SourceIP, SourceDevice,
+    Target, TargetDeviceId, ParentProcess, FileName, ProcessCommandLine
+| order by NTLMTime desc
 
-// ── C4. CREDENTIAL DUMP → LDAP RECON → DOMAIN LOGON ─────────────────────────
-// LSASS dump → LDAP bulk enumeration → lateral network logon
+// ── C4. CREDENTIAL DUMP → AD RECON → LATERAL LOGONS ─────────────────────────
+// LSASS access on a device → LDAP/SAMR burst from that device → same account logs on to 3+ hosts
 // Tables: DeviceEvents, IdentityQueryEvents, IdentityLogonEvents
 
 let lookback = 24h;
 let CredentialDump =
     DeviceEvents
     | where Timestamp > ago(lookback)
-    | where ActionType == "OpenProcessApiCall"
-    | where FileName =~ "lsass.exe"
-    | where InitiatingProcessFileName !in~ ("MsMpEng.exe","csrss.exe","werfault.exe")
-    | project DumpTime = Timestamp, DeviceName, AccountName, InitiatingProcessFileName;
-
-let LdapRecon =
+    | where ActionType == "OpenProcessApiCall" and FileName =~ "lsass.exe"
+    | where InitiatingProcessFileName !in~ ("MsMpEng.exe","MsSense.exe","SenseIR.exe","csrss.exe",
+        "werfault.exe","WerFaultSecure.exe","svchost.exe","wininit.exe","taskmgr.exe")
+    | extend Host = tolower(tostring(split(DeviceName, ".")[0]))
+    | summarize DumpTime = min(Timestamp), DumpTools = make_set(InitiatingProcessFileName, 5)
+        by Host, DeviceId, DeviceName;
+let Recon =
     IdentityQueryEvents
     | where Timestamp > ago(lookback)
-    | where ActionType == "LdapSearch"
-    | where QueryCount >= 20
-    | project ReconTime = Timestamp, AccountUpn, IPAddress, QueryCount;
-
-let DomainLogons =
+    | where ActionType contains "LDAP" or ActionType == "SAMR query"
+    | extend Host = tolower(tostring(split(DeviceName, ".")[0]))
+    | summarize ReconTime = min(Timestamp), QueryCount = count(),
+        ReconAccounts = make_set(AccountName, 5) by Host
+    | where QueryCount >= 20;
+let LateralLogons =
     IdentityLogonEvents
     | where Timestamp > ago(lookback)
-    | where ActionType == "LogonSuccess"
-    | where LogonType == "Network"
-    | project LogonTime = Timestamp, AccountUpn, TargetDeviceName;
-
+    | where ActionType == "LogonSuccess" and AccountName !endswith "$"
+    | summarize FirstLogon = min(Timestamp), TargetHosts = dcount(DestinationDeviceName),
+        Targets = make_set(DestinationDeviceName, 20) by AccountName;
 CredentialDump
-| join kind=inner LdapRecon on $left.AccountName == $right.AccountUpn
+| join kind=inner Recon on Host
 | where ReconTime > DumpTime
-| join kind=inner DomainLogons on $left.AccountName == $right.AccountUpn
-| where LogonTime > ReconTime
-| project DumpTime, ReconTime, LogonTime, AccountName,
-    SourceDevice = DeviceName, InitiatingProcessFileName, TargetDeviceName
+| mv-expand AccountName = ReconAccounts to typeof(string)
+| join kind=inner LateralLogons on AccountName
+| where FirstLogon > DumpTime and TargetHosts >= 3
+| project DumpTime, ReconTime, FirstLogon, DeviceId, DeviceName, DumpTools, QueryCount,
+    AccountName, TargetHosts, Targets
+| order by DumpTime desc
 
-// ── C5. INSIDER: BULK DOWNLOAD + EXTERNAL SHARE ──────────────────────────────
-// Recently dormant user (likely resigning) + bulk cloud download + external share
-// Tables: AADSignInEventsBeta, CloudAppEvents
+// ── C5. INSIDER: BULK DOWNLOAD + EXTERNAL SHARE (same user, same day) ────────
+// 50+ file downloads and an external/anonymous share by the same user within 24h
+// Tables: CloudAppEvents
 
 let lookback = 30d;
-let RecentlyDormant =
-    AADSignInEventsBeta
-    | where Timestamp > ago(180d)
-    | summarize LastSignin = max(Timestamp) by AccountUpn = UserPrincipalName
-    | where LastSignin between (ago(lookback) .. ago(7d));
-
 let BulkDownloads =
     CloudAppEvents
     | where Timestamp > ago(lookback)
     | where ActionType in ("FileDownloaded","FileSyncDownloadedFull")
-    | summarize Downloads = count(),
-        SizeBytes = sum(tolong(parse_json(RawEventData).FileSizeBytes))
-        by AccountUpn, bin(Timestamp, 1d)
+    | summarize Downloads = count(), SizeBytes = sum(tolong(RawEventData.FileSizeBytes)),
+        User = any(tostring(RawEventData.UserId))
+        by AccountObjectId, Day = bin(Timestamp, 1d)
     | where Downloads >= 50;
-
 let ExternalShares =
     CloudAppEvents
     | where Timestamp > ago(lookback)
-    | where ActionType in ("SharingInvitationCreated","AnonymousLinkCreated")
-    | project ShareTime = Timestamp, AccountUpn, IPAddress;
-
-RecentlyDormant
-| join kind=inner BulkDownloads on AccountUpn
-| join kind=inner ExternalShares on AccountUpn
-| project AccountUpn, LastSignin, Downloads, SizeBytes, ShareTime, IPAddress
+    | where ActionType in ("SharingInvitationCreated","AnonymousLinkCreated","AddedToSecureLink")
+    | extend TargetType = tostring(RawEventData.TargetUserOrGroupType)
+    | where ActionType == "AnonymousLinkCreated" or TargetType =~ "Guest"
+    | summarize Shares = count(), SharedItems = make_set(ObjectName, 10),
+        ShareIPs = make_set(IPAddress, 5)
+        by AccountObjectId, Day = bin(Timestamp, 1d);
+BulkDownloads
+| join kind=inner ExternalShares on AccountObjectId, Day
+| project Day, User, AccountObjectId, Downloads, SizeMB = round(SizeBytes / 1048576.0, 1),
+    Shares, SharedItems, ShareIPs
+| order by Downloads desc
 
 // ── C6. RANSOMWARE KILL CHAIN ────────────────────────────────────────────────
-// Phish email → shadow copy delete → mass file encryption
+// Shadow-copy deletion → mass rename-to-new-extension on the same device within 1h,
+// flagged if the device's user received a delivered phish in the prior 7 days
 // Tables: EmailEvents, DeviceProcessEvents, DeviceFileEvents
 
 let lookback = 24h;
-let PhishDelivered =
+let PhishRecipients =
     EmailEvents
-    | where Timestamp > ago(lookback)
-    | where ThreatTypes has "Phish"
-    | where DeliveryAction == "Delivered"
-    | distinct RecipientEmailAddress;
-
+    | where Timestamp > ago(7d)
+    | where ThreatTypes has "Phish" and DeliveryAction == "Delivered"
+    | distinct Recipient = tolower(RecipientEmailAddress);
 let ShadowDelete =
     DeviceProcessEvents
     | where Timestamp > ago(lookback)
-    | where ProcessCommandLine has_any (
-        "vssadmin delete shadows",
-        "wmic shadowcopy delete",
-        "bcdedit /set recoveryenabled no"
-    )
-    | project ShadowTime = Timestamp, DeviceName, AccountName, ProcessCommandLine;
-
+    | where ProcessCommandLine has_any ("vssadmin delete shadows","wmic shadowcopy delete",
+        "Win32_ShadowCopy","bcdedit /set recoveryenabled no","wbadmin delete catalog")
+    | project ShadowTime = Timestamp, DeviceId, DeviceName, ShadowAccount = AccountName,
+        ShadowUpn = tolower(InitiatingProcessAccountUpn), ProcessCommandLine;
 let MassEncrypt =
     DeviceFileEvents
     | where Timestamp > ago(lookback)
-    | where ActionType in ("FileModified","FileRenamed")
-    | summarize FileCount = count()
-        by DeviceName, AccountName, bin(Timestamp, 5m)
-    | where FileCount >= 100
-    | project EncryptTime = Timestamp, DeviceName, AccountName, FileCount;
-
+    | where ActionType == "FileRenamed"
+    | extend NewExt = tolower(extract(@"\.([^.\\]+)$", 1, FileName)),
+             OldExt = tolower(extract(@"\.([^.\\]+)$", 1, PreviousFileName))
+    | where isnotempty(NewExt) and NewExt != OldExt
+    | summarize FileCount = count(), NewExtensions = make_set(NewExt, 5),
+        EncryptUpn = tolower(any(InitiatingProcessAccountUpn))
+        by DeviceId, EncryptTime = bin(Timestamp, 5m)
+    | where FileCount >= 100;
 ShadowDelete
-| join kind=inner MassEncrypt on DeviceName
-| where EncryptTime > ShadowTime
-| project ShadowTime, EncryptTime, DeviceName, AccountName, ProcessCommandLine, FileCount
+| join kind=inner MassEncrypt on DeviceId
+| where EncryptTime between ((ShadowTime - 5m) .. (ShadowTime + 1h))
+| extend RecentPhishRecipient = ShadowUpn in (PhishRecipients) or EncryptUpn in (PhishRecipients)
+| project ShadowTime, EncryptTime, DeviceId, DeviceName, ShadowAccount, ProcessCommandLine,
+    FileCount, NewExtensions, RecentPhishRecipient
+| order by ShadowTime desc
 
-// ── C7. ORPHAN HIGH/MEDIUM ALERTS WITHOUT INCIDENTS ──────────────────────────
-// Surfaces high/medium severity alerts not attached to any incident
-// Useful for finding detections that slipped through triage
+// ── C7. MULTI-PRODUCT ALERT CONVERGENCE ON ONE ENTITY ────────────────────────
+// Same user or device hit by high/medium alerts from 2+ Defender products in 24h
+// (Advanced Hunting doesn't expose incident IDs, so this is how to
+// surface cross-pillar activity that triage may be handling as separate alerts)
+// Tables: AlertInfo, AlertEvidence
+
 AlertInfo
 | where Timestamp > ago(7d)
 | where Severity in ("High","Medium")
-| join kind=leftanti (
+| join kind=inner (
     AlertEvidence
-    | where isnotempty(ServiceSource)
-    | distinct AlertId
+    | where Timestamp > ago(7d)
+    | where EntityType in ("User","Machine")
+    | extend Entity = iff(EntityType == "User",
+        tolower(coalesce(AccountUpn, AccountName)), tolower(coalesce(DeviceName, DeviceId)))
+    | where isnotempty(Entity)
+    | distinct AlertId, EntityType, Entity
 ) on AlertId
-| project Timestamp, AlertId, Title, Severity, Category, ServiceSource, DetectionSource
-| order by Severity asc, Timestamp desc
+| summarize Products = dcount(ServiceSource), ProductList = make_set(ServiceSource, 10),
+    Alerts = dcount(AlertId), Titles = make_set(Title, 15), Severities = make_set(Severity),
+    FirstAlert = min(Timestamp), LastAlert = max(Timestamp)
+    by EntityType, Entity, Window = bin(Timestamp, 1d)
+| where Products >= 2
+| order by Products desc, Alerts desc
