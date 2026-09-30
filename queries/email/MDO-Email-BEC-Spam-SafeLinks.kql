@@ -1,0 +1,257 @@
+// ============================================================================
+// MDO EMAIL — Spam, Phishing, BEC, Inbox Rules, SafeLinks
+// Platform: Microsoft Defender XDR — Advanced Hunting
+// Tables: EmailEvents, EmailUrlInfo, EmailAttachmentInfo,
+//         EmailPostDeliveryEvents, UrlClickEvents, CloudAppEvents
+// ============================================================================
+
+// ── 1. SPAM & PHISHING ANALYSIS ──────────────────────────────────────────────
+
+// 1.1 Top spam sources last 7 days
+EmailEvents
+| where Timestamp > ago(7d)
+| where DeliveryAction == "Blocked" or ThreatTypes has "Spam"
+| summarize SpamCount = count(), UniqueRecipients = dcount(RecipientEmailAddress)
+    by SenderFromAddress, SenderIPv4
+| top 25 by SpamCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.2 High-risk users by phishing detections
+EmailEvents
+| where Timestamp > ago(30d)
+| where ThreatTypes has "Phish"
+| summarize PhishCount = count(), LatestAttempt = max(Timestamp)
+    by RecipientEmailAddress
+| where PhishCount >= 3
+| order by PhishCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.3 Phishing campaign clustering by subject similarity
+EmailEvents
+| where Timestamp > ago(7d)
+| where ThreatTypes has "Phish"
+| summarize Volume = count(), UniqueTargets = dcount(RecipientEmailAddress),
+    FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by Subject, SenderFromDomain
+| where Volume >= 3
+| order by Volume desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.4 High-volume outbound send anomaly (BEC prep — ATO often sends bulk)
+EmailEvents
+| where Timestamp > ago(24h)
+| where EmailDirection == "Outbound"
+| summarize SentCount = count() by SenderFromAddress, bin(Timestamp, 1h)
+| where SentCount >= 50
+| order by SentCount desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 1.5 Phishing block rate by type (posture/reporting use case)
+EmailEvents
+| where Timestamp > ago(30d)
+| where ThreatTypes has "Phish"
+| extend PhishingType = case(
+    ThreatTypes has "DomainImpersonation", "Domain Impersonation",
+    ThreatTypes has "UserImpersonation", "User Impersonation",
+    ThreatTypes has "BrandImpersonation", "Brand Impersonation",
+    ThreatTypes has "SpoofedDomain", "Spoofing",
+    "Generic Phishing"
+)
+| summarize
+    Total = count(),
+    Blocked = countif(DeliveryAction in ("Quarantined", "Blocked")),
+    Delivered = countif(DeliveryAction == "Delivered")
+    by PhishingType
+| extend BlockRate = round((Blocked * 100.0) / Total, 2)
+| order by BlockRate asc
+
+// ── 2. BEC INDICATORS ────────────────────────────────────────────────────────
+
+// 2.1 Display name spoofing — exec impersonation from wrong domain
+// Customize ExecutiveNames for your org
+let ExecutiveNames = dynamic(["CEO", "CFO", "President", "Director", "VP"]);
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where SenderFromDomain !endswith "yourdomain.com" // replace with your domain
+| extend FromNameUpper = toupper(SenderDisplayName)
+| where FromNameUpper has_any (ExecutiveNames)
+| project Timestamp, SenderDisplayName, SenderFromAddress, SenderFromDomain,
+    RecipientEmailAddress, Subject, ThreatTypes, DeliveryAction
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.2 Wire/payment/ACH keyword detection in inbound mail
+EmailEvents
+| where Timestamp > ago(7d)
+| where EmailDirection == "Inbound"
+| where Subject has_any ("wire", "transfer", "ACH", "payment", "invoice", "urgent",
+    "W-2", "payroll", "bank account", "routing number")
+| where ThreatTypes has "Phish" or DeliveryAction != "Delivered"
+| project Timestamp, SenderFromAddress, RecipientEmailAddress, Subject, ThreatTypes, DeliveryAction
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 2.3 Lookalike / typosquatting domain detection
+// Replace regex with your domain pattern
+EmailEvents
+| where Timestamp > ago(30d)
+| where EmailDirection == "Inbound"
+| where SenderFromDomain matches regex @"c[o0]nt[o0]s[o0]|cont0so|contos0" // customize
+| project Timestamp, SenderFromAddress, SenderFromDomain, RecipientEmailAddress, Subject, DeliveryAction
+| order by Timestamp desc
+
+// ── 3. INBOX RULE MANIPULATION ───────────────────────────────────────────────
+
+// 3.1 All inbox rule creation/modification events
+CloudAppEvents
+| where Timestamp > ago(7d)
+| where ActionType in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| extend RuleDetails = parse_json(RawEventData)
+| project Timestamp, AccountDisplayName, AccountUpn, IPAddress, ActionType,
+    RuleName = tostring(RuleDetails.Name),
+    ForwardTo = tostring(RuleDetails.ForwardTo),
+    RedirectTo = tostring(RuleDetails.RedirectTo),
+    DeleteMessage = tostring(RuleDetails.DeleteMessage),
+    MarkAsRead = tostring(RuleDetails.MarkAsRead)
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.2 Suspicious inbox rules (forwarding externally or silently deleting)
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where ActionType in ("New-InboxRule", "Set-InboxRule", "UpdateInboxRules")
+| extend RuleDetails = parse_json(RawEventData)
+| extend ForwardTo    = tostring(RuleDetails.ForwardTo)
+| extend DeleteMsg    = tostring(RuleDetails.DeleteMessage)
+| extend MoveToFolder = tostring(RuleDetails.MoveToFolder)
+| where ForwardTo has "@"
+    or DeleteMsg == "true"
+    or MoveToFolder has_any ("Deleted", "RSS", "Junk")
+| project Timestamp, AccountUpn, IPAddress, ActionType,
+    ForwardTo, DeleteMsg, MoveToFolder, RawEventData
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.3 Mailbox-level forwarding changes (Set-Mailbox — separate from inbox rules)
+// Replace UPN below or remove filter for tenant-wide sweep
+let UPN = "user@domain.com"; // replace or remove for all mailboxes
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where AccountId == UPN
+| where Application == "Microsoft Exchange Online"
+| where ActionType == "Set-Mailbox"
+| extend Params = todynamic(RawEventData).Parameters
+| mv-expand Params
+| extend ParamName  = tostring(Params.Name)
+| extend ParamValue = tostring(Params.Value)
+| where ParamName in (
+    "ForwardingSmtpAddress",
+    "ForwardingAddress",
+    "DeliverToMailboxAndForward",
+    "HiddenFromAddressListsEnabled"
+)
+| project Timestamp, AccountId, ActionType, ParamName, ParamValue, IPAddress, CountryCode
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.4 IR: Mailbox rules correlated with risky sign-in sessions
+let UPN = "user@domain.com"; // replace
+let mailBoxActions = pack_array(
+    "New-InboxRule", "Set-InboxRule", "UpdateInboxRules",
+    "Enable-InboxRule", "Set-Mailbox", "Set-TransportRule"
+);
+let riskyIPs =
+    AADSignInEventsBeta
+    | where AccountUpn == UPN
+    | where RiskLevelDuringSignIn >= 10
+    | where Timestamp > ago(30d)
+    | distinct IPAddress;
+CloudAppEvents
+| where Timestamp > ago(30d)
+| where AccountId == UPN
+| where Application == "Microsoft Exchange Online"
+| where ActionType in (mailBoxActions)
+| extend RuleConfig = tostring(RawEventData["Parameters"])
+| project Timestamp, ActionType, IPAddress, ISP, CountryCode, City, RuleConfig, RawEventData
+| order by Timestamp desc
+
+// ── 4. URL / SAFELINKS ───────────────────────────────────────────────────────
+
+// 4.1 SafeLinks blocked click trends (posture / reporting)
+UrlClickEvents
+| where Timestamp > ago(30d)
+| where ActionType == "ClickBlocked"
+| summarize
+    BlockedClicks = count(),
+    UniqueUsers   = dcount(AccountUpn),
+    UniqueUrls    = dcount(Url),
+    TopUrls       = make_set(Url, 10)
+    by bin(Timestamp, 1d)
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 4.2 IR: URL click investigation — SafeLinks click events
+// Replace TargetDomain with IOC domain
+let TargetDomain = "malicious-example.com"; // replace with IOC domain
+let TargetURL    = "login.malicious-example.com"; // replace with full URL if known
+UrlClickEvents
+| where Timestamp > ago(30d)
+| where Url has TargetDomain or Url has TargetURL
+| project Timestamp, Url, AccountUpn, ActionType,
+    IPAddress, IsClickedThrough, NetworkMessageId, UrlChain, Workload
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 4.3 IR: URL to email delivery correlation
+let TargetDomain = "malicious-example.com"; // replace with IOC domain
+EmailUrlInfo
+| where Timestamp > ago(30d)
+| where Url has TargetDomain
+| join kind=inner (
+    EmailEvents
+    | where Timestamp > ago(30d)
+    | project NetworkMessageId, SenderFromAddress, RecipientEmailAddress,
+        Subject, DeliveryAction, DeliveryLocation, ThreatTypes,
+        LatestDeliveryAction, LatestDeliveryLocation, EmailDirection
+) on NetworkMessageId
+| project Timestamp, Url, SenderFromAddress, RecipientEmailAddress, Subject,
+    DeliveryAction, DeliveryLocation, ThreatTypes, LatestDeliveryAction, NetworkMessageId
+| order by Timestamp desc
+
+// ── 5. POST-DELIVERY & ATTACHMENTS ───────────────────────────────────────────
+
+// 5.1 ZAP effectiveness by day
+EmailPostDeliveryEvents
+| where Timestamp > ago(14d)
+| where ActionType in ("ZAP", "ZapPhish", "ZapMalware")
+| summarize
+    ZAPCount      = count(),
+    PhishZAP      = countif(ActionType == "ZapPhish"),
+    MalwareZAP    = countif(ActionType == "ZapMalware"),
+    UniqueRecipients = dcount(RecipientEmailAddress)
+    by bin(Timestamp, 1d)
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 5.2 Malicious attachment evasion pattern detection
+EmailAttachmentInfo
+| where Timestamp > ago(7d)
+| where ThreatTypes has_any ("Malware", "HighConfidenceMalware")
+| extend FileExtension = extract(@"\.([^.]+)$", 1, FileName)
+| summarize AttachCount = count(), UniqueFiles = dcount(FileName),
+    SampleFiles = make_set(FileName, 10)
+    by FileExtension, ThreatTypes
+| order by AttachCount desc
