@@ -1,46 +1,66 @@
 // ============================================================================
 // MDCA CLOUD APPS — OAuth, Exfiltration, Shadow IT, Admin Abuse
 // Platform: Microsoft Defender XDR — Advanced Hunting
-// Tables: CloudAppEvents, AADSignInEventsBeta
+// Tables: CloudAppEvents, EntraIdSignInEvents, DeviceNetworkEvents
+//
+// SCHEMA NOTES
+// - CloudAppEvents has NO AccountUpn column. For Microsoft 365 events the UPN
+//   lives in RawEventData.UserId, so each query extends AccountUpn from it.
+//   AccountObjectId is the reliable key for joins to other tables.
+// - Entra ID audit operations in CloudAppEvents usually end with a period
+//   ("Consent to application."), so matches use startswith / has, not ==.
+// - EntraIdSignInEvents replaces AADSignInEventsBeta (deprecated 2026-10-19).
+//   On an older tenant, swap the table name back if needed.
 // ============================================================================
 
 // ── 1. OAUTH APP ABUSE ───────────────────────────────────────────────────────
 
 // 1.1 High-privilege OAuth app consent events
+let HighRiskScopes = dynamic(["Mail.ReadWrite","Mail.Read","Mail.Send","Files.ReadWrite.All",
+    "Sites.ReadWrite.All","Directory.ReadWrite.All","User.ReadWrite.All",
+    "full_access_as_user","EWS.AccessAsUser.All","offline_access"]);
 CloudAppEvents
 | where Timestamp > ago(30d)
-| where ActionType == "Consent to application"
-| extend ConsentDetails = parse_json(RawEventData)
-| extend Scopes = tostring(ConsentDetails.OAuthApplicationGrantScope)
-| where Scopes has_any ("Mail.ReadWrite","Files.ReadWrite.All","Directory.ReadWrite.All",
-    "full_access_as_user","User.ReadWrite.All","EWS.AccessAsUser.All")
-| project Timestamp, AccountUpn, Application, Scopes, IPAddress, CountryCode
+| where ActionType startswith "Consent to application"
+| extend Raw = tostring(RawEventData)
+| where Raw has_any (HighRiskScopes)
+| extend AccountUpn = tostring(RawEventData.UserId),
+    ConsentedScopes = extract(@"Scope:\s*([^,\]]+)", 1, Raw),
+    IsAdminConsent  = Raw has "IsAdminConsent" and Raw matches regex @"IsAdminConsent[^}]*True"
+| project Timestamp, AccountUpn, AccountObjectId, AppName = ObjectName, ConsentedScopes,
+    IsAdminConsent, IPAddress, CountryCode
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.2 OAuth app granted tenant-wide admin consent (service principal added)
+// 1.2 OAuth app granted tenant-wide admin consent
 CloudAppEvents
 | where Timestamp > ago(30d)
-| where ActionType == "Add service principal"
-| extend Details = parse_json(RawEventData)
-| project Timestamp, AccountUpn, Application, IPAddress,
-    DisplayName   = tostring(Details.ObjectId),
-    AdditionalFields
+| where ActionType startswith "Consent to application"
+| mv-apply Prop = RawEventData.ModifiedProperties on (
+    where tostring(Prop.Name) == "ConsentContext.IsAdminConsent"
+    | extend IsAdminConsent = tostring(Prop.NewValue)
+  )
+| where IsAdminConsent =~ "True"
+| extend AccountUpn = tostring(RawEventData.UserId),
+    ConsentedScopes = extract(@"Scope:\s*([^,\]]+)", 1, tostring(RawEventData))
+| project Timestamp, AccountUpn, AccountObjectId, AppName = ObjectName, ConsentedScopes,
+    IPAddress, CountryCode
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.3 Unusual OAuth app token refresh from new location
-CloudAppEvents
+// 1.3 Unusual app sign-in spread — same user + app from 3+ countries (7d)
+EntraIdSignInEvents
 | where Timestamp > ago(7d)
-| where ActionType == "UserLoggedIn"
-| where Application !in~ ("Microsoft Teams","Microsoft SharePoint Online",
-    "Office 365 Exchange Online","Microsoft Graph")
-| summarize Logons = count(), Countries = dcount(CountryCode),
+| where ErrorCode == 0
+| where Application !in~ ("Microsoft Teams","Office 365 SharePoint Online",
+    "Office 365 Exchange Online","Microsoft Graph","Microsoft Office")
+| summarize SignIns = count(), Countries = dcount(Country), CountryList = make_set(Country, 10),
     IPs = dcount(IPAddress), LastSeen = max(Timestamp)
     by Application, AccountUpn
-| where Countries >= 3 or Logons >= 50
-| order by Logons desc
+| where Countries >= 3
+| order by Countries desc, SignIns desc
 
 // ── 2. DATA EXFILTRATION ─────────────────────────────────────────────────────
 
@@ -48,44 +68,58 @@ CloudAppEvents
 CloudAppEvents
 | where Timestamp > ago(7d)
 | where ActionType in ("FileDownloaded","FileSyncDownloadedFull")
-| summarize Downloads = count(),
-    SizeBytes = sum(tolong(parse_json(RawEventData).FileSizeBytes))
-    by AccountUpn, bin(Timestamp, 1h)
+| extend AccountUpn = tostring(RawEventData.UserId),
+    FileSizeBytes = tolong(RawEventData.FileSizeBytes)
+| summarize Downloads = count(), SizeBytes = sum(FileSizeBytes),
+    SampleFiles = make_set(ObjectName, 10)
+    by AccountUpn, AccountObjectId, bin(Timestamp, 1h)
 | where Downloads >= 100 or SizeBytes >= 104857600
+| extend SizeMB = round(SizeBytes / 1048576.0, 1)
 | order by Downloads desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.2 External file sharing outside tenant domain
+// 2.2 External file sharing outside tenant domain + anonymous links
 // Replace yourdomain.com with your domain
+let InternalDomain = "yourdomain.com"; // customize
 CloudAppEvents
 | where Timestamp > ago(7d)
-| where ActionType in ("SharingInvitationCreated","AnonymousLinkCreated","SharingSet")
-| extend SharingDetails = parse_json(RawEventData)
-| extend SharedWith = tostring(SharingDetails.TargetUserOrGroupEmailAddress)
-| where SharedWith !endswith "yourdomain.com" and isnotempty(SharedWith) // customize
-| project Timestamp, AccountUpn, ActionType, SharedWith, IPAddress
+| where ActionType in ("SharingInvitationCreated","AnonymousLinkCreated","SharingSet","AddedToSecureLink")
+| extend AccountUpn = tostring(RawEventData.UserId),
+    SharedWith = tostring(RawEventData.TargetUserOrGroupName),
+    TargetType = tostring(RawEventData.TargetUserOrGroupType)
+| where ActionType == "AnonymousLinkCreated"
+    or TargetType =~ "Guest"
+    or (SharedWith has "@" and not(SharedWith endswith InternalDomain))
+| project Timestamp, AccountUpn, ActionType, SharedWith, TargetType,
+    FileOrSite = ObjectName, IPAddress
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.3 Personal cloud storage uploads (Dropbox / Google Drive / Box)
-CloudAppEvents
+// 2.3 Personal cloud storage access from managed endpoints (MDE)
+// CloudAppEvents only covers apps with an MDCA API connector, so this uses
+// endpoint network telemetry. It shows access, not bytes uploaded.
+let PersonalStorage = dynamic(["dropbox.com","dropboxusercontent.com","drive.google.com",
+    "docs.google.com","box.com","wetransfer.com","mega.nz","onedrive.live.com","icloud.com"]);
+DeviceNetworkEvents
 | where Timestamp > ago(7d)
-| where Application in~ ("Dropbox","Google Drive","Box","WeTransfer","OneDrive Personal")
-| where ActionType in ("FileUploaded","FileCreated","Upload")
-| summarize UploadCount = count() by AccountUpn, Application, bin(Timestamp, 1h)
-| where UploadCount >= 10
-| order by UploadCount desc
+| where ActionType == "ConnectionSuccess"
+| where RemoteUrl has_any (PersonalStorage)
+| summarize Connections = count(), Sites = make_set(RemoteUrl, 10),
+    Processes = make_set(InitiatingProcessFileName, 10)
+    by DeviceName, InitiatingProcessAccountUpn, bin(Timestamp, 1h)
+| where Connections >= 10
+| order by Connections desc
 
 // ── 3. IMPOSSIBLE TRAVEL / SUSPICIOUS LOGON ──────────────────────────────────
 
 // 3.1 Impossible travel — 3+ countries in 6-hour window
-CloudAppEvents
+EntraIdSignInEvents
 | where Timestamp > ago(7d)
-| where ActionType == "UserLoggedIn"
-| summarize Countries = dcount(CountryCode), LogonCount = count(),
-    CountryList = make_set(CountryCode, 10),
+| where ErrorCode == 0 and isnotempty(Country)
+| summarize Countries = dcount(Country), SignInCount = count(),
+    CountryList = make_set(Country, 10),
     IPList      = make_set(IPAddress, 10)
     by AccountUpn, bin(Timestamp, 6h)
 | where Countries >= 3
@@ -93,55 +127,67 @@ CloudAppEvents
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 3.2 Logon from anonymous proxy / Tor exit node
+// 3.2 Activity from anonymous proxy / Tor / botnet IPs
 CloudAppEvents
 | where Timestamp > ago(7d)
-| where ActionType == "UserLoggedIn"
-| where IPTags has_any ("Anonymous proxy","Tor","Botnet")
-| project Timestamp, AccountUpn, Application, IPAddress, CountryCode, IPTags
+| where IsAnonymousProxy == true
+    or tostring(IPTags) has_any ("Anonymous proxy","Tor","Botnet")
+| extend AccountUpn = tostring(RawEventData.UserId)
+| summarize Events = count(), Actions = make_set(ActionType, 20),
+    FirstSeen = min(Timestamp), LastSeen = max(Timestamp)
+    by AccountUpn, AccountObjectId, Application, IPAddress, CountryCode, IPCategory
+| order by Events desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 3.3 First-ever access to a cloud app by user (last 7 days, <=3 accesses)
+// 3.3 First-ever access to a cloud app by user (new in last 7 days, <=3 accesses)
+// Advanced Hunting retains 30 days, so "first-ever" means first in 30 days
 CloudAppEvents
-| where Timestamp > ago(90d)
+| where Timestamp > ago(30d)
+| extend AccountUpn = tostring(RawEventData.UserId)
+| where isnotempty(AccountObjectId)
 | summarize FirstAccess = min(Timestamp), AccessCount = count()
-    by AccountUpn, Application
+    by AccountObjectId, AccountUpn, Application
 | where FirstAccess > ago(7d) and AccessCount <= 3
 | order by FirstAccess desc
 
 // ── 4. ADMIN ACTIVITY AUDITING ───────────────────────────────────────────────
 
-// 4.1 Global admin activity outside business hours
+// 4.1 Privileged directory changes outside business hours (UTC — adjust)
 CloudAppEvents
 | where Timestamp > ago(30d)
 | where ActionType has_any ("Add member to role","Remove member from role",
-    "Set domain authentication","Set company information")
+    "Set domain authentication","Set company information","Add service principal credentials",
+    "Update application – Certificates and secrets management","Set federation settings on domain")
 | where hourofday(Timestamp) !between (7 .. 18)
     or dayofweek(Timestamp) in (0d, 6d)
-| project Timestamp, AccountUpn, ActionType, Application, IPAddress, CountryCode
+| extend AccountUpn = tostring(RawEventData.UserId), Target = tostring(RawEventData.ObjectId)
+| project Timestamp, AccountUpn, ActionType, Target, Application, IPAddress, CountryCode
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
 // 4.2 Bulk user account operations (10+ operations in 1 hour)
 CloudAppEvents
 | where Timestamp > ago(7d)
-| where ActionType in ("Delete user","Disable account","Reset user password",
-    "Remove member from group")
-| summarize OperationCount = count(),
-    AffectedUsers = make_set(tostring(parse_json(RawEventData).TargetResources), 20)
+| where ActionType has_any ("Delete user","Disable account","Reset user password",
+    "Remove member from group","Update user")
+| extend AccountUpn = tostring(RawEventData.UserId), Target = tostring(RawEventData.ObjectId)
+| summarize OperationCount = count(), AffectedObjects = make_set(Target, 25)
     by AccountUpn, ActionType, bin(Timestamp, 1h)
 | where OperationCount >= 10
 | order by OperationCount desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 4.3 Email/message deletion anomalies (mail purge, bulk delete)
+// 4.3 Mailbox bulk deletion anomaly (50+ delete operations in 1 hour)
+// Requires mailbox auditing (on by default in Exchange Online)
 CloudAppEvents
 | where Timestamp > ago(14d)
 | where Application == "Microsoft Exchange Online"
-| where ActionType in ("Delete messages","Move messages to Deleted Items folder",
-    "Permanently delete messages","Move messages to folder")
-| summarize DeleteCount = count() by AccountUpn, ActionType, bin(Timestamp, 1h)
-| where DeleteCount >= 50
-| order by DeleteCount desc
+| where ActionType in ("SoftDelete","HardDelete","MoveToDeletedItems")
+| extend AccountUpn = tostring(RawEventData.UserId),
+    MailboxOwner = tostring(RawEventData.MailboxOwnerUPN)
+| summarize DeleteOps = count() by AccountUpn, MailboxOwner, ActionType, bin(Timestamp, 1h)
+| where DeleteOps >= 50
+| order by DeleteOps desc
