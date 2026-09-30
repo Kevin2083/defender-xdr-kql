@@ -1,0 +1,8 @@
+{
+  "name": "kql-validate",
+  "version": "1.0.0",
+  "description": "Semantic validation of the Defender XDR KQL library using Microsoft's Kusto.Language parser",
+  "private": true,
+  "scripts": { "validate": "node check.js ../../queries" },
+  "dependencies": { "@kusto/language-service-next": "^12.4.1" }
+}
