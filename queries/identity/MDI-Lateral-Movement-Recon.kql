@@ -2,84 +2,100 @@
 // MDI / ENTRA ID IDENTITY — Logon, Recon, Privilege Escalation, Lateral Movement
 // Platform: Microsoft Defender XDR — Advanced Hunting
 // Tables: IdentityLogonEvents, IdentityDirectoryEvents, IdentityQueryEvents,
-//         AADSignInEventsBeta, CloudAppEvents
+//         EntraIdSignInEvents, CloudAppEvents
+//
+// SCHEMA NOTES
+// - IdentityLogonEvents ActionType: "LogonSuccess" / "LogonFailed".
+//   It has a Location column (no Country column).
+// - IdentityDirectoryEvents group changes: ActionType "Group Membership changed"
+//   with AdditionalFields["TO.GROUP"], ["FROM.GROUP"], ["TARGET_OBJECT.USER"].
+// - IdentityQueryEvents: "SAMR query", plus LDAP events (matched with
+//   ActionType contains "LDAP" to cover both the classic and newer LDAP events).
+// - On-prem failures often have an empty AccountUpn; counts use AccountName.
+// - EntraIdSignInEvents replaces AADSignInEventsBeta (deprecated 2026-10-19).
 // ============================================================================
 
 // ── 1. SIGN-IN & AUTHENTICATION ──────────────────────────────────────────────
 
-// 1.1 Failed sign-ins by user (>5 failures in 7 days)
+// 1.1 Failed sign-ins by account (>5 failures in 7 days)
 IdentityLogonEvents
 | where Timestamp > ago(7d)
 | where ActionType == "LogonFailed"
-| summarize FailedAttempts = count() by AccountUpn, IPAddress, Application
+| summarize FailedAttempts = count(), Reasons = make_set(FailureReason, 5),
+    SourceIPs = make_set(IPAddress, 10)
+    by AccountName, AccountDomain, AccountUpn, Application
 | where FailedAttempts > 5
 | order by FailedAttempts desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.2 Successful sign-ins from new countries (leftanti baseline)
-let knownCountries =
+// 1.2 Successful sign-ins from a location not seen for that account in prior 3 weeks
+let knownLocations =
     IdentityLogonEvents
     | where Timestamp between (ago(30d) .. ago(7d))
-    | where ActionType == "LogonSuccess"
+    | where ActionType == "LogonSuccess" and isnotempty(Location)
     | distinct AccountUpn, Location;
 IdentityLogonEvents
 | where Timestamp > ago(7d)
 | where ActionType == "LogonSuccess"
-| where Location != ""
-| join kind=leftanti knownCountries on AccountUpn, Location
-| project Timestamp, AccountUpn, Location, IPAddress, Application, DeviceName
+| where isnotempty(Location) and isnotempty(AccountUpn)
+| join kind=leftanti knownLocations on AccountUpn, Location
+| project Timestamp, AccountUpn, Location, IPAddress, Isp, Application, DeviceName
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.3 Legacy authentication sign-ins (IMAP/POP/SMTP/EAS — blocks MFA)
-AADSignInEventsBeta
+// 1.3 Legacy authentication sign-ins (IMAP/POP/SMTP/EAS — bypass MFA)
+EntraIdSignInEvents
 | where Timestamp > ago(7d)
-| where ClientAppUsed in ("Exchange ActiveSync","IMAP4","POP3","SMTP",
-    "Authenticated SMTP","Other clients")
-| project Timestamp, AccountUpn, ClientAppUsed, IPAddress, Country,
-    ErrorCode, RiskLevelDuringSignIn
+| where ClientAppUsed in ("Exchange ActiveSync","IMAP4","POP3","Authenticated SMTP",
+    "Other clients","Exchange Web Services","MAPI Over HTTP","Offline Address Book",
+    "Autodiscover","Exchange Online PowerShell","Reporting Web Services")
+| project Timestamp, AccountUpn, ClientAppUsed, Application, IPAddress, Country,
+    ErrorCode, RiskLevelDuringSignIn, ConditionalAccessStatus
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.4 Sign-ins outside business hours
+// 1.4 Sign-ins outside business hours (Timestamp is UTC — adjust window)
 IdentityLogonEvents
 | where Timestamp > ago(7d)
 | where ActionType == "LogonSuccess"
 | extend HourOfDay = hourofday(Timestamp)
 | where HourOfDay < 6 or HourOfDay > 22
-| project Timestamp, AccountUpn, IPAddress, Location, Application, HourOfDay
+| project Timestamp, AccountUpn, AccountName, IPAddress, Location, Application, HourOfDay
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.5 Token theft detection (3+ countries or 10+ IPs per account in 7d)
-AADSignInEventsBeta
+// 1.5 Token theft indicator (3+ countries or 10+ IPs per account in 7d)
+EntraIdSignInEvents
 | where Timestamp > ago(7d)
 | where ErrorCode == 0
 | summarize
     UniqueIPs       = dcount(IPAddress),
     UniqueCountries = dcount(Country),
+    Countries       = make_set(Country, 10),
     UniqueDevices   = dcount(DeviceName),
     SignInCount     = count()
-    by AccountUpn
-| where UniqueCountries > 3 or UniqueIPs > 10
+    by AccountUpn, AccountObjectId
+| where UniqueCountries >= 3 or UniqueIPs > 10
 | order by UniqueCountries desc, UniqueIPs desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.6 Password spray detection (10+ targeted accounts from one IP per hour)
+// 1.6 Password spray (10+ distinct accounts failing from one IP per hour)
 IdentityLogonEvents
 | where Timestamp > ago(24h)
 | where ActionType == "LogonFailed"
-| where FailureReason has_any ("password","credential","invalid")
+| where isnotempty(IPAddress)
 | summarize
-    TargetedAccounts = dcount(AccountUpn),
-    AttemptCount     = count()
+    TargetedAccounts = dcount(AccountName),
+    AttemptCount     = count(),
+    FailureReasons   = make_set(FailureReason, 5),
+    SampleAccounts   = make_set(AccountName, 15)
     by IPAddress, bin(Timestamp, 1h)
-| where TargetedAccounts > 10
+| where TargetedAccounts >= 10
 | order by TargetedAccounts desc
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -88,54 +104,59 @@ IdentityLogonEvents
 IdentityLogonEvents
 | where Timestamp > ago(24h)
 | where ActionType == "LogonFailed"
-| summarize FailedAttempts = count() by AccountUpn, IPAddress, bin(Timestamp, 15m)
-| where FailedAttempts > 10
+| summarize FailedAttempts = count(), FailureReasons = make_set(FailureReason, 5)
+    by AccountName, AccountDomain, IPAddress, bin(Timestamp, 15m)
+| where FailedAttempts >= 10
 | order by FailedAttempts desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.8 Successful login after multiple failures (credential stuffing success)
+// 1.8 Successful logon after multiple failures from the same IP (stuffing success)
 let failures =
     IdentityLogonEvents
     | where Timestamp > ago(24h)
     | where ActionType == "LogonFailed"
-    | summarize FailedAttempts = count(), LastFailure = max(Timestamp) by AccountUpn, IPAddress;
+    | summarize FailedAttempts = count(), LastFailure = max(Timestamp) by AccountName, IPAddress;
 let successes =
     IdentityLogonEvents
     | where Timestamp > ago(24h)
     | where ActionType == "LogonSuccess"
-    | project SuccessTime = Timestamp, AccountUpn, IPAddress;
+    | project SuccessTime = Timestamp, AccountName, AccountUpn, IPAddress, Application;
 failures
-| join kind=inner successes on AccountUpn, IPAddress
-| where SuccessTime > LastFailure
 | where FailedAttempts > 5
-| project AccountUpn, IPAddress, FailedAttempts, LastFailure, SuccessTime,
-    TimeBetween = SuccessTime - LastFailure
+| join kind=inner successes on AccountName, IPAddress
+| where SuccessTime > LastFailure
+| summarize FirstSuccessAfter = min(SuccessTime) by AccountName, AccountUpn, IPAddress,
+    FailedAttempts, LastFailure, Application
+| extend TimeBetween = FirstSuccessAfter - LastFailure
 | order by FailedAttempts desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.9 Dormant account suddenly active (no sign-in for 60d, now active)
-let dormantThreshold = 60d;
-let dormantAccounts =
+// 1.9 Dormant account suddenly active
+// Advanced Hunting keeps 30 days, so "dormant" = no successful logon days 30..7
+let priorActive =
     IdentityLogonEvents
-    | where Timestamp between (ago(dormantThreshold) .. ago(7d))
-    | where ActionType == "LogonSuccess"
-    | distinct AccountUpn;
+    | where Timestamp between (ago(30d) .. ago(7d))
+    | where ActionType == "LogonSuccess" and isnotempty(AccountName)
+    | distinct AccountName;
 IdentityLogonEvents
 | where Timestamp > ago(7d)
-| where ActionType == "LogonSuccess"
-| join kind=leftanti dormantAccounts on AccountUpn
-| project Timestamp, AccountUpn, IPAddress, Location, Application
-| order by Timestamp desc
+| where ActionType == "LogonSuccess" and isnotempty(AccountName)
+| where AccountName !endswith "$" // skip computer accounts
+| join kind=leftanti priorActive on AccountName
+| summarize FirstSeen = min(Timestamp), Logons = count(), IPs = make_set(IPAddress, 10),
+    Locations = make_set(Location, 5)
+    by AccountName, AccountUpn, Application
+| order by FirstSeen desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 1.10 Device registration from IP not used in past 29 days
-let historicalDays = 29;
-let searchWindow   = 1d;
+// 1.10 Device registration from an IP the user hasn't signed in from in 29 days
+let historicalWindow = 29d;
+let searchWindow     = 1d;
 let NewRegistrations =
-    AADSignInEventsBeta
+    EntraIdSignInEvents
     | where Timestamp > ago(searchWindow)
     | where Application == "Device Registration Service"
     | where isnotempty(IPAddress) and isnotempty(AccountUpn)
@@ -143,8 +164,8 @@ let NewRegistrations =
         Country, City, DeviceName, OSPlatform, Browser;
 NewRegistrations
 | join kind=leftanti (
-    AADSignInEventsBeta
-    | where Timestamp between (ago(historicalDays + 1d) .. ago(searchWindow))
+    EntraIdSignInEvents
+    | where Timestamp between (ago(historicalWindow + searchWindow) .. ago(searchWindow))
     | where isnotempty(IPAddress) and isnotempty(AccountUpn)
     | distinct AccountUpn, IPAddress
 ) on AccountUpn, $left.RegIP == $right.IPAddress
@@ -156,120 +177,144 @@ NewRegistrations
 // 2.1 LDAP bulk object enumeration (50+ queries per hour)
 IdentityQueryEvents
 | where Timestamp > ago(7d)
-| where ActionType == "LdapSearch"
+| where ActionType contains "LDAP" or Protocol =~ "Ldap"
 | summarize QueryCount = count(), UniqueQueries = dcount(Query),
-    QueryTypes = make_set(QueryType, 10)
-    by AccountUpn, IPAddress, bin(Timestamp, 1h)
+    QueryTypes = make_set(QueryType, 10), SampleTargets = make_set(QueryTarget, 10)
+    by AccountName, AccountUpn, DeviceName, IPAddress, bin(Timestamp, 1h)
 | where QueryCount >= 50
 | order by QueryCount desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.2 SMB share enumeration (SamrEnumerateUsers)
+// 2.2 SAMR enumeration (net user / net group style recon of users & groups)
 IdentityQueryEvents
 | where Timestamp > ago(7d)
-| where ActionType in ("SamrSensitiveSecurityAccountRpc","SamrEnumerateUsers")
-| summarize EnumCount = count(), TargetMachines = make_set(TargetDeviceName)
-    by AccountUpn, IPAddress
+| where ActionType == "SAMR query"
+| summarize EnumCount = count(), QueryTypes = make_set(QueryType, 10),
+    Targets = make_set(QueryTarget, 20), DomainControllers = make_set(DestinationDeviceName, 5)
+    by AccountName, DeviceName, IPAddress
+| where EnumCount >= 10
 | order by EnumCount desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 2.3 Active Directory admin group enumeration via LDAP
+// 2.3 Privileged group enumeration (LDAP or SAMR)
 IdentityQueryEvents
 | where Timestamp > ago(7d)
-| where ActionType == "LdapSearch"
-| where Query has_any ("Domain Admins","Enterprise Admins","Schema Admins",
+| where ActionType contains "LDAP" or ActionType == "SAMR query"
+| where QueryTarget has_any ("Domain Admins","Enterprise Admins","Schema Admins",
     "Administrators","Backup Operators","Account Operators")
-| project Timestamp, AccountUpn, IPAddress, Query, QueryType
+    or Query has_any ("Domain Admins","Enterprise Admins","Schema Admins","adminCount=1")
+| project Timestamp, AccountName, DeviceName, IPAddress, ActionType, QueryType, QueryTarget, Query
+| order by Timestamp desc
 
 // ── 3. PRIVILEGE ESCALATION ──────────────────────────────────────────────────
 
-// 3.1 DCSync attack — DRSR replication rights abuse
+// 3.1 Directory replication (DCSync) by a non-sync account
+// Exclude your DC computer accounts and directory-sync service accounts
 IdentityDirectoryEvents
 | where Timestamp > ago(7d)
-| where ActionType == "DirectoryServiceReplication"
-| where not (AccountUpn has_any ("MSOL_","AADConnect","AzureAD"))
-| project Timestamp, AccountUpn, AccountDomain, IPAddress,
-    TargetDeviceName, AdditionalFields
+| where ActionType has "replication"
+| where AccountName !endswith "$"
+| where not(AccountName has_any ("MSOL_","AAD_","Sync_")) // Entra Connect / cloud sync accounts
+| project Timestamp, ActionType, AccountName, AccountDomain, DeviceName, IPAddress,
+    DestinationDeviceName, AdditionalFields
+| order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
 // 3.2 AdminSDHolder modification (ACL persistence technique)
 IdentityDirectoryEvents
 | where Timestamp > ago(30d)
-| where ActionType == "ObjectModified"
-| where TargetObjectName contains "AdminSDHolder"
-| project Timestamp, AccountUpn, IPAddress, TargetObjectName, AdditionalFields
-
-// ──────────────────────────────────────────────────────────────────────────────
-
-// 3.3 Privileged group membership changes (Domain/Enterprise Admins etc.)
-IdentityDirectoryEvents
-| where Timestamp > ago(7d)
-| where ActionType in ("GroupMemberAdded","GroupMemberRemoved")
-| extend GroupName = tostring(parse_json(AdditionalFields).TargetObject)
-| where GroupName has_any ("Domain Admins","Enterprise Admins","Schema Admins",
-    "Protected Users","Administrators","Backup Operators")
-| project Timestamp, AccountUpn, ActionType, GroupName, IPAddress
-
-// ──────────────────────────────────────────────────────────────────────────────
-
-// 3.4 Sensitive group changes (custom list — populate per environment)
-let sensitiveGroups = dynamic(["Domain Admins","Enterprise Admins",
-    "Global Administrators","Security Administrators",
-    "Exchange Administrators","Privileged Role Administrators"]);
-IdentityDirectoryEvents
-| where Timestamp > ago(30d)
-| where ActionType in ("Group member added","Group member removed")
-| extend GroupName = tostring(AdditionalFields.["TO.GROUP"])
-| where GroupName has_any (sensitiveGroups)
-| extend TargetUser = tostring(AdditionalFields.["TARGET_OBJECT.USER"])
-| project Timestamp, AccountUpn, ActionType, GroupName, TargetUser, IPAddress
+| where tostring(AdditionalFields) has "AdminSDHolder"
+    or TargetAccountDisplayName has "AdminSDHolder"
+| project Timestamp, ActionType, AccountName, AccountUpn, DeviceName, IPAddress,
+    TargetAccountDisplayName, AdditionalFields
 | order by Timestamp desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 3.5 Azure AD role assignment changes
+// 3.3 Built-in privileged group membership changes
+let PrivGroups = dynamic(["Domain Admins","Enterprise Admins","Schema Admins",
+    "Administrators","Account Operators","Backup Operators","Server Operators",
+    "Print Operators","DnsAdmins","Group Policy Creator Owners","Protected Users"]);
+IdentityDirectoryEvents
+| where Timestamp > ago(7d)
+| where ActionType == "Group Membership changed"
+| extend AddedToGroup     = tostring(AdditionalFields["TO.GROUP"]),
+         RemovedFromGroup = tostring(AdditionalFields["FROM.GROUP"]),
+         TargetAccount    = tostring(AdditionalFields["TARGET_OBJECT.USER"])
+| where AddedToGroup in~ (PrivGroups) or RemovedFromGroup in~ (PrivGroups)
+| project Timestamp, ChangedBy = AccountName, AddedToGroup, RemovedFromGroup, TargetAccount,
+    DeviceName, IPAddress
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.4 Custom sensitive group changes (populate per environment)
+let sensitiveGroups = dynamic(["Domain Admins","Enterprise Admins",
+    "Tier0-Admins","VPN-Admins","Firewall-Admins","Citrix-Admins"]); // customize
+IdentityDirectoryEvents
+| where Timestamp > ago(30d)
+| where ActionType == "Group Membership changed"
+| extend AddedToGroup     = tostring(AdditionalFields["TO.GROUP"]),
+         RemovedFromGroup = tostring(AdditionalFields["FROM.GROUP"]),
+         TargetAccount    = tostring(AdditionalFields["TARGET_OBJECT.USER"])
+| where AddedToGroup has_any (sensitiveGroups) or RemovedFromGroup has_any (sensitiveGroups)
+| project Timestamp, ChangedBy = AccountName, AddedToGroup, RemovedFromGroup, TargetAccount, IPAddress
+| order by Timestamp desc
+
+// ──────────────────────────────────────────────────────────────────────────────
+
+// 3.5 Entra ID role assignment changes (incl. PIM eligible)
 CloudAppEvents
 | where Timestamp > ago(30d)
-| where ActionType in ("Add member to role","Remove member from role",
-    "Add eligible member to role")
-| extend RoleDetails = parse_json(RawEventData)
-| project Timestamp, AccountUpn, ActionType, IPAddress,
-    RoleName    = tostring(RoleDetails.Role_DisplayName),
-    TargetUser  = tostring(RoleDetails.TargetResources)
+| where ActionType has_any ("Add member to role","Remove member from role",
+    "Add eligible member to role","Remove eligible member from role")
+| extend AccountUpn = tostring(RawEventData.UserId),
+    TargetUser  = tostring(RawEventData.ObjectId)
+| mv-apply Prop = RawEventData.ModifiedProperties on (
+    where tostring(Prop.Name) == "Role.DisplayName"
+    | extend RoleName = tostring(Prop.NewValue)
+  )
+| project Timestamp, AccountUpn, ActionType, RoleName, TargetUser, IPAddress, CountryCode
+| order by Timestamp desc
 
 // ── 4. NTLM / LATERAL MOVEMENT ───────────────────────────────────────────────
 
-// 4.1 NTLM logon anomalies (Pass-the-Hash indicators)
+// 4.1 NTLM logon fan-out (one account hitting many hosts over NTLM — PtH indicator)
 IdentityLogonEvents
 | where Timestamp > ago(7d)
 | where Protocol == "NTLM"
 | where ActionType == "LogonSuccess"
-| where not (IPAddress has_any ("10.","192.168.")) // customize to your internal ranges
-| project Timestamp, AccountUpn, IPAddress, TargetDeviceName, Protocol
+| where AccountName !endswith "$"
+| summarize Targets = dcount(DestinationDeviceName), TargetList = make_set(DestinationDeviceName, 20),
+    SourceIPs = make_set(IPAddress, 10), Logons = count()
+    by AccountName, AccountDomain, bin(Timestamp, 1h)
+| where Targets >= 5
+| order by Targets desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 4.2 Kerberoasting — SPN enumeration + TGS requests
+// 4.2 Kerberoasting recon — LDAP searches for accounts with SPNs
 IdentityQueryEvents
 | where Timestamp > ago(7d)
-| where ActionType == "LdapSearch"
+| where ActionType contains "LDAP" or Protocol =~ "Ldap"
 | where Query has "servicePrincipalName"
-| summarize SPNCount = count(), SPNs = make_set(Query, 20)
-    by AccountUpn, IPAddress, bin(Timestamp, 1h)
-| where SPNCount >= 5
-| order by SPNCount desc
+| summarize SPNQueries = count(), SampleQueries = make_set(Query, 10)
+    by AccountName, DeviceName, IPAddress, bin(Timestamp, 1h)
+| where SPNQueries >= 5
+| order by SPNQueries desc
 
 // ──────────────────────────────────────────────────────────────────────────────
 
-// 4.3 Impossible travel — logon from 2+ countries within 4 hours
+// 4.3 Impossible travel — successful logons from 2+ locations within 4 hours
 IdentityLogonEvents
 | where Timestamp > ago(7d)
 | where ActionType == "LogonSuccess"
-| summarize Countries = dcount(Location), CountryList = make_set(Location, 10),
+| where isnotempty(AccountUpn) and isnotempty(Location)
+| summarize Locations = dcount(Location), LocationList = make_set(Location, 10),
     IPList = make_set(IPAddress, 10)
     by AccountUpn, bin(Timestamp, 4h)
-| where Countries >= 2 and isnotempty(AccountUpn)
-| order by Countries desc
+| where Locations >= 2
+| order by Locations desc
